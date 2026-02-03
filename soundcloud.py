@@ -2,234 +2,202 @@
 import argparse
 import json
 import re
-import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse
+from typing import Dict, List, Optional, Tuple
 
+import feedparser
 import requests
-from bs4 import BeautifulSoup
-
-BASE = "https://soundcloud.com"
 
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def sanitize_name(name: str, max_len: int = 80) -> str:
-    name = name.strip()
-    name = re.sub(r"\s+", " ", name)
-    name = re.sub(r"[^\w\-\. ]+", "_", name, flags=re.UNICODE)
-    name = name.replace(" ", "_")
-    return name[:max_len] if len(name) > max_len else name
+def sanitize_name(s: str, max_len: int = 120) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\-. ]+", "_", s, flags=re.UNICODE)
+    s = s.replace(" ", "_")
+    return s[:max_len] if len(s) > max_len else s
 
 
-def strip_query(url: str) -> str:
-    """Remove query/fragment to make stable keys for visited/library."""
-    p = urlparse(url)
-    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
 
 
-@dataclass
-class PlaylistData:
-    url: str
-    title: str
-    tracks: List[str]
+def save_json(path: Path, obj) -> None:
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-class SoundCloudCollector:
-    def __init__(self, out_dir: Path, sleep_s: float = 0.5):
-        self.out_dir = out_dir
-        self.sleep_s = sleep_s
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; sc-collector/1.0; +https://soundcloud.com)",
-            "Accept-Language": "en-US,en;q=0.9,hu;q=0.8",
-        })
+def parse_feeds_file(path: Path) -> List[Tuple[Optional[str], str]]:
+    feeds: List[Tuple[Optional[str], str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" in line:
+            name, url = line.split("|", 1)
+            feeds.append((name.strip() or None, url.strip()))
+        else:
+            feeds.append((None, line))
+    return feeds
 
-        self.library_path = self.out_dir / "library.json"
-        self.visited_path = self.out_dir / "visited.json"
-        self.playlists_dir = self.out_dir / "playlists"
 
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.playlists_dir.mkdir(parents=True, exist_ok=True)
+def best_enclosure(entry) -> Optional[str]:
+    # Standard RSS: entry.enclosures[0].href
+    enclosures = getattr(entry, "enclosures", None) or []
+    for enc in enclosures:
+        href = getattr(enc, "href", None) or enc.get("href")
+        if href:
+            return href
 
-    # ---------- persistence ----------
-    def load_json(self, path: Path, default):
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-        return default
+    # Sometimes: entry.links with rel="enclosure"
+    links = getattr(entry, "links", None) or []
+    for l in links:
+        if (l.get("rel") == "enclosure") and l.get("href"):
+            return l["href"]
 
-    def save_json(self, path: Path, obj) -> None:
-        path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    return None
 
-    def load_library(self) -> Dict[str, dict]:
-        return self.load_json(self.library_path, {})
 
-    def load_visited(self) -> Dict[str, dict]:
-        return self.load_json(self.visited_path, {})
+def stable_episode_key(feed_url: str, entry) -> str:
+    # Prefer GUID/ID, else fallback to enclosure URL, else link/title combo
+    guid = getattr(entry, "id", None) or entry.get("id")
+    if guid:
+        return f"{feed_url}::id::{guid}"
 
-    # ---------- fetch & parse ----------
-    def fetch_html(self, url: str) -> str:
-        r = self.session.get(url, timeout=30)
+    enc = best_enclosure(entry)
+    if enc:
+        return f"{feed_url}::enc::{enc}"
+
+    link = getattr(entry, "link", None) or entry.get("link") or ""
+    title = getattr(entry, "title", None) or entry.get("title") or ""
+    return f"{feed_url}::lt::{link}::{title}"
+
+
+def download_file(url: str, dest: Path, timeout_s: int = 60) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=timeout_s) as r:
         r.raise_for_status()
-        time.sleep(self.sleep_s)
-        return r.text
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+        tmp.replace(dest)
 
-    def extract_playlist_urls_from_search(self, search_url: str) -> List[str]:
-        """
-        Extract playlist URLs from the 'no-JS' HTML version of the search page.
-        Note: This may not return ALL results compared to JS infinite scroll.
-        """
-        html = self.fetch_html(search_url)
-        soup = BeautifulSoup(html, "html.parser")
 
-        urls: Set[str] = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if "/sets/" in href:
-                full = urljoin(BASE, href)
-                urls.add(strip_query(full))
-
-        return sorted(urls)
-
-    def extract_playlist_title_and_tracks(self, playlist_url: str) -> PlaylistData:
-        html = self.fetch_html(playlist_url)
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Title: first H1 is usually "Playlist name by User"
-        h1 = soup.find("h1")
-        title = h1.get_text(strip=True) if h1 else playlist_url
-
-        # Track links: typically /{user}/{track-slug} (2 path segments)
-        track_urls: Set[str] = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if not href.startswith("/"):
-                continue
-            if "/sets/" in href:
-                continue  # skip playlist links
-            # ignore obvious non-track endpoints
-            parts = href.strip("/").split("/")
-            if len(parts) != 2:
-                continue
-            if parts[1] in {"tracks", "albums", "sets", "reposts", "likes", "followers", "following"}:
-                continue
-
-            full = urljoin(BASE, href)
-            track_urls.add(strip_query(full))
-
-        return PlaylistData(url=strip_query(playlist_url), title=title, tracks=sorted(track_urls))
-
-    # ---------- output structure ----------
-    def write_playlist_folder(self, pl: PlaylistData) -> None:
-        folder = self.playlists_dir / sanitize_name(pl.title)
-        folder.mkdir(parents=True, exist_ok=True)
-
-        (folder / "playlist_url.txt").write_text(pl.url + "\n", encoding="utf-8")
-        (folder / "tracks.txt").write_text("\n".join(pl.tracks) + ("\n" if pl.tracks else ""), encoding="utf-8")
-
-        meta = {
-            "url": pl.url,
-            "title": pl.title,
-            "track_count": len(pl.tracks),
-            "updated_at": iso_now(),
-            "tracks": pl.tracks,
-        }
-        self.save_json(folder / "playlist.json", meta)
-
-    # ---------- commands ----------
-    def cmd_collect(self, search_url: str, limit_playlists: Optional[int] = None) -> None:
-        library = self.load_library()
-
-        playlist_urls = self.extract_playlist_urls_from_search(search_url)
-        if limit_playlists is not None:
-            playlist_urls = playlist_urls[:limit_playlists]
-
-        print(f"Found {len(playlist_urls)} playlist URLs on search page.")
-        for i, pl_url in enumerate(playlist_urls, 1):
-            try:
-                pl = self.extract_playlist_title_and_tracks(pl_url)
-                self.write_playlist_folder(pl)
-
-                library[pl.url] = {
-                    "title": pl.title,
-                    "tracks": pl.tracks,
-                    "track_count": len(pl.tracks),
-                    "updated_at": iso_now(),
-                    "source_search_url": strip_query(search_url),
-                }
-                print(f"[{i}/{len(playlist_urls)}] {pl.title} -> {len(pl.tracks)} tracks")
-            except requests.HTTPError as e:
-                print(f"[{i}/{len(playlist_urls)}] ERROR fetching {pl_url}: {e}")
-
-        self.save_json(self.library_path, library)
-        print(f"Library saved: {self.library_path}")
-
-    def cmd_next(self, n: int) -> None:
-        library = self.load_library()
-        visited = self.load_visited()
-
-        remaining: List[Tuple[str, str]] = []  # (playlist_title, track_url)
-
-        for pl_url, pl_meta in library.items():
-            title = pl_meta.get("title", pl_url)
-            for t in pl_meta.get("tracks", []):
-                key = strip_query(t)
-                if key not in visited:
-                    remaining.append((title, key))
-
-        print(f"Unvisited tracks total: {len(remaining)}")
-        for title, url in remaining[:n]:
-            print(f"{title} :: {url}")
-
-    def cmd_mark(self, urls: List[str], note: str = "") -> None:
-        visited = self.load_visited()
-
-        for u in urls:
-            key = strip_query(u)
-            visited[key] = {
-                "visited_at": iso_now(),
-                "note": note,
-            }
-            print(f"Marked visited: {key}")
-
-        self.save_json(self.visited_path, visited)
-        print(f"Visited saved: {self.visited_path}")
+def pick_extension_from_url(url: str) -> str:
+    # very simple heuristic
+    m = re.search(r"\.([a-zA-Z0-9]{2,5})(?:\?|$)", url)
+    if m:
+        ext = m.group(1).lower()
+        if ext in {"mp3", "m4a", "aac", "wav", "ogg", "opus", "flac"}:
+            return "." + ext
+    return ".mp3"
 
 
 def main():
-    p = argparse.ArgumentParser(description="SoundCloud playlist/track link collector + visited list.")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    p_collect = sub.add_parser("collect", help="Collect playlists + tracks from a SoundCloud search/sets URL.")
-    p_collect.add_argument("--url", required=True, help="SoundCloud search/sets URL")
-    p_collect.add_argument("--out", required=True, help="Output folder")
-    p_collect.add_argument("--limit-playlists", type=int, default=None, help="Optional limit for number of playlists")
-
-    p_next = sub.add_parser("next", help="Print next unvisited tracks (links).")
-    p_next.add_argument("--out", required=True, help="Output folder")
-    p_next.add_argument("--n", type=int, default=20, help="How many to print")
-
-    p_mark = sub.add_parser("mark", help="Mark one or more track URLs as visited.")
-    p_mark.add_argument("--out", required=True, help="Output folder")
-    p_mark.add_argument("--url", action="append", required=True, help="Track URL (can be given multiple times)")
-    p_mark.add_argument("--note", default="", help="Optional note (e.g., processed by pipeline X)")
-
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="RSS podcast downloader with visited.json (no re-download).")
+    ap.add_argument("--feeds", required=True, help="Path to feeds.txt (one RSS per line, optional Name|URL).")
+    ap.add_argument("--out", required=True, help="Output directory.")
+    ap.add_argument("--limit", type=int, default=0, help="Max episodes per feed this run (0 = no limit).")
+    ap.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds.")
+    ap.add_argument("--dry-run", action="store_true", help="Parse feeds and list what would download, without downloading.")
+    args = ap.parse_args()
 
     out_dir = Path(args.out).expanduser().resolve()
-    sc = SoundCloudCollector(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.cmd == "collect":
-        sc.cmd_collect(args.url, limit_playlists=args.limit_playlists)
-    elif args.cmd == "next":
-        sc.cmd_next(args.n)
-    elif args.cmd == "mark":
-        sc.cmd_mark(args.url, note=args.note)
+    visited_path = out_dir / "visited.json"
+    visited: Dict[str, dict] = load_json(visited_path, {})
+
+    feeds = parse_feeds_file(Path(args.feeds))
+    print(f"Feeds: {len(feeds)} | Output: {out_dir}")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "podcast-rss-downloader/1.0"})
+
+    total_new = 0
+
+    for custom_name, feed_url in feeds:
+        print(f"\n== Feed: {feed_url}")
+        d = feedparser.parse(feed_url)
+
+        feed_title = (d.feed.get("title") if hasattr(d, "feed") else None) or custom_name or feed_url
+        folder_name = sanitize_name(custom_name or feed_title)
+        feed_dir = out_dir / folder_name
+        feed_dir.mkdir(parents=True, exist_ok=True)
+
+        # save feed metadata snapshot
+        save_json(feed_dir / "feed_meta.json", {
+            "feed_url": feed_url,
+            "title": feed_title,
+            "updated_at": iso_now(),
+        })
+
+        entries = list(getattr(d, "entries", []) or [])
+        print(f"Entries found: {len(entries)}")
+
+        downloaded_this_feed = 0
+        for entry in entries:
+            if args.limit and downloaded_this_feed >= args.limit:
+                break
+
+            enc = best_enclosure(entry)
+            if not enc:
+                continue
+
+            key = stable_episode_key(feed_url, entry)
+            if key in visited:
+                continue
+
+            title = getattr(entry, "title", None) or entry.get("title") or "episode"
+            safe_title = sanitize_name(title, max_len=140)
+
+            ext = pick_extension_from_url(enc)
+            filename = f"{safe_title}{ext}"
+            dest = feed_dir / filename
+
+            # avoid overwriting if same filename exists
+            if dest.exists():
+                # add a short suffix
+                suffix = sanitize_name(str(abs(hash(key)))[:8])
+                dest = feed_dir / f"{safe_title}_{suffix}{ext}"
+
+            print(f"NEW: {title}")
+            print(f"  -> {dest.name}")
+            if not args.dry_run:
+                # use requests directly (session.get stream)
+                with session.get(enc, stream=True, timeout=args.timeout) as r:
+                    r.raise_for_status()
+                    tmp = dest.with_suffix(dest.suffix + ".part")
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                f.write(chunk)
+                    tmp.replace(dest)
+
+            visited[key] = {
+                "visited_at": iso_now(),
+                "feed_url": feed_url,
+                "feed_title": feed_title,
+                "episode_title": title,
+                "enclosure_url": enc,
+                "saved_as": str(dest.relative_to(out_dir)),
+            }
+
+            downloaded_this_feed += 1
+            total_new += 1
+
+        print(f"Downloaded new this feed: {downloaded_this_feed}")
+
+    save_json(visited_path, visited)
+    print(f"\nDone. New downloads: {total_new}")
+    print(f"Visited saved: {visited_path}")
 
 
 if __name__ == "__main__":
