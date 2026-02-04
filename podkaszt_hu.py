@@ -5,7 +5,7 @@ import argparse
 import hashlib
 import os
 import re
-import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError
 
-BASE_URL_DEFAULT = "https://podkaszt.hu/adasok/uj/"
+BASE_URL_DEFAULT = "https://podkaszt.hu/adasok/uj/" # podcastok 20 oldalanként 3500 oldal
 AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav")
 
 COOKIE_ACCEPT_REGEX = re.compile(r"(Beleegyezés|Elfogadom|Accept|Agree|Allow)", re.I)
@@ -38,75 +38,27 @@ def slugify(name: str, max_len: int = 180) -> str:
     return name or "untitled"
 
 
-def init_db(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS episodes (
-            episode_key TEXT PRIMARY KEY,
-            title TEXT,
-            producer TEXT,
-            date TEXT,
-            status TEXT,
-            audio_url TEXT,
-            filename TEXT,
-            error TEXT,
-            added_at TEXT,
-            downloaded_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pages (
-            page INTEGER PRIMARY KEY,
-            scanned_at TEXT
-        )
-    """)
-    conn.commit()
-    return conn
+def load_visited(path: Path) -> set[str]:
+    visited = set()
+    if not path.exists():
+        return visited
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # format: key<TAB>date<TAB>producer<TAB>title
+            key = line.split("\t", 1)[0].strip()
+            if key:
+                visited.add(key)
+    return visited
 
 
-def is_page_scanned(conn: sqlite3.Connection, page: int) -> bool:
-    return bool(conn.execute("SELECT 1 FROM pages WHERE page=?", (page,)).fetchone())
-
-
-def mark_page_scanned(conn: sqlite3.Connection, page: int):
-    conn.execute("""
-        INSERT INTO pages(page, scanned_at) VALUES(?, ?)
-        ON CONFLICT(page) DO UPDATE SET scanned_at=excluded.scanned_at
-    """, (page, now_utc_iso()))
-    conn.commit()
-
-
-def is_downloaded(conn: sqlite3.Connection, episode_key: str) -> bool:
-    row = conn.execute("SELECT status FROM episodes WHERE episode_key=?", (episode_key,)).fetchone()
-    return bool(row and row[0] == "downloaded")
-
-
-def upsert_episode(conn: sqlite3.Connection, episode_key: str, title: str, producer: str, date: str):
-    conn.execute("""
-        INSERT INTO episodes(episode_key, title, producer, date, status, audio_url, filename, error, added_at, downloaded_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(episode_key) DO UPDATE SET
-            title=excluded.title,
-            producer=excluded.producer,
-            date=excluded.date
-    """, (episode_key, title, producer, date, "queued", None, None, None, now_utc_iso(), None))
-    conn.commit()
-
-
-def mark_status(conn: sqlite3.Connection, episode_key: str, status: str,
-                audio_url: Optional[str] = None, filename: Optional[str] = None, error: Optional[str] = None):
-    downloaded_at = now_utc_iso() if status == "downloaded" else None
-    conn.execute("""
-        UPDATE episodes
-        SET status=?,
-            audio_url=COALESCE(?, audio_url),
-            filename=COALESCE(?, filename),
-            error=COALESCE(?, error),
-            downloaded_at=COALESCE(?, downloaded_at)
-        WHERE episode_key=?
-    """, (status, audio_url, filename, error, downloaded_at, episode_key))
-    conn.commit()
+def append_visited(path: Path, episode_key: str, date: str, producer: str, title: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{episode_key}\t{date}\t{producer}\t{title}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
 
 
 def accept_cookies_if_present(page) -> bool:
@@ -114,7 +66,7 @@ def accept_cookies_if_present(page) -> bool:
     try:
         btn = page.get_by_role("button", name=COOKIE_ACCEPT_REGEX)
         if btn.count() > 0:
-            btn.first.click(timeout=2500)
+            btn.first.click(timeout=3000)
             page.wait_for_timeout(400)
             return True
     except Exception:
@@ -125,7 +77,7 @@ def accept_cookies_if_present(page) -> bool:
         try:
             btn = frame.get_by_role("button", name=COOKIE_ACCEPT_REGEX)
             if btn.count() > 0:
-                btn.first.click(timeout=2500)
+                btn.first.click(timeout=3000)
                 page.wait_for_timeout(400)
                 return True
         except Exception:
@@ -135,6 +87,7 @@ def accept_cookies_if_present(page) -> bool:
 
 
 def find_table(page):
+    # Prefer a table with headers containing "Cím" and "Előadó"
     tables = page.locator("table")
     for i in range(tables.count()):
         t = tables.nth(i)
@@ -166,67 +119,35 @@ def header_map(table):
 
 
 def get_first_row_signature(page) -> str:
-    """
-    Used to detect page change after clicking pagination.
-    """
     table = find_table(page)
     if not table:
         return ""
     hm = header_map(table)
-    title_i, prod_i, date_i = hm["title"], hm["producer"], hm["date"]
-    if title_i is None or prod_i is None or date_i is None:
+    ti, pi, di = hm["title"], hm["producer"], hm["date"]
+    if ti is None or pi is None or di is None:
         return ""
     row = table.locator("tbody tr").first
     if row.count() == 0:
         return ""
     tds = row.locator("td")
     try:
-        title = tds.nth(title_i).inner_text().strip()
-        prod = tds.nth(prod_i).inner_text().strip()
-        date = tds.nth(date_i).inner_text().strip()
+        title = tds.nth(ti).inner_text().strip()
+        prod = tds.nth(pi).inner_text().strip()
+        date = tds.nth(di).inner_text().strip()
         return f"{title}|{prod}|{date}"
     except Exception:
         return ""
 
 
-def get_pagination_scope(page):
-    """
-    Try to narrow down to the pagination area near "Oldalak: N".
-    If not found, fall back to full page.
-    """
-    label = page.locator("text=/Oldalak:\\s*\\d+/").first
-    if label.count() == 0:
-        return page
-
-    # Walk up a few ancestors to get a container that includes the page buttons
-    node = label
-    for _ in range(6):
-        try:
-            node = node.locator("xpath=..")
-            # if it contains clickable elements with numbers, use it
-            if node.locator("text=/^2$/").count() > 0:
-                return node
-            if node.locator("a,button").count() > 0:
-                # still might be okay
-                pass
-        except Exception:
-            break
-
-    return page
-
-
 def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> bool:
     """
-    Click the pagination number (2, 3, 4...) reliably.
-    Strategy:
-      A) Try accessible button/link/role=button with exact visible text
-      B) Fallback: find any element with exact text and click the one near the top of the page
-    Then wait until table content changes.
+    Click pagination number (2,3,4...) robustly:
+    - tries semantic button/link
+    - fallback: click the 'N' element near top of page (pagination), not table row index
     """
     before = get_first_row_signature(page)
     target = str(target_page)
 
-    # --- A) Accessible / semantic tries ---
     tries = []
     try:
         tries.append(page.get_by_role("button", name=target))
@@ -237,7 +158,6 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
     except Exception:
         pass
 
-    # Playwright text-is (exact match), often works when the number is inside a <button>
     tries.append(page.locator(f"button:has(:text-is('{target}'))"))
     tries.append(page.locator(f"a:has(:text-is('{target}'))"))
     tries.append(page.locator(f"[role=button]:has(:text-is('{target}'))"))
@@ -248,7 +168,6 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
                 el = loc.first
                 el.scroll_into_view_if_needed()
                 el.click(timeout=3000)
-                # wait for change
                 try:
                     page.wait_for_function(
                         "(prev) => {"
@@ -268,14 +187,14 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
         except Exception:
             continue
 
-    # --- B) Bounding-box fallback (click the '2' that's near the top, i.e. pagination) ---
+    # Fallback: find exact text near top
     candidates = page.locator(f":text-is('{target}')")
     cnt = candidates.count()
     if cnt == 0:
         return False
 
     best = None  # (y, locator)
-    for i in range(min(cnt, 80)):  # cap scanning to avoid huge loops
+    for i in range(min(cnt, 80)):
         try:
             el = candidates.nth(i)
             if not el.is_visible():
@@ -283,17 +202,12 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
             box = el.bounding_box()
             if not box:
                 continue
-
-            # Pagination is near the top center; table rows are much lower.
-            # Tune this threshold if needed.
-            if box["y"] > 250:
+            # pagination is near top; ignore table rows lower down
+            if box["y"] > 260:
                 continue
-
-            # Prefer small-ish boxes (pagination buttons), not big containers
             if box["width"] > 200 or box["height"] > 120:
                 continue
 
-            # Try to click a clickable ancestor (button/link/role=button), else click itself
             clickable = None
             for xpath in [
                 "xpath=ancestor-or-self::button[1]",
@@ -306,7 +220,8 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
                     break
 
             target_el = clickable or el
-            best = (box["y"], target_el) if best is None else (min(best[0], box["y"]), target_el if box["y"] < best[0] else best[1])
+            if best is None or box["y"] < best[0]:
+                best = (box["y"], target_el)
         except Exception:
             continue
 
@@ -319,7 +234,6 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
     except Exception:
         return False
 
-    # wait for table change
     try:
         page.wait_for_function(
             "(prev) => {"
@@ -337,7 +251,6 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
         page.wait_for_timeout(900)
 
     return True
-
 
 
 def get_audio_url_from_player(page, wait_s: float = 12.0) -> Optional[str]:
@@ -365,13 +278,20 @@ def guess_ext_from_url(url: str) -> str:
     return ext if ext in AUDIO_EXTS else ".mp3"
 
 
+def sync_cookies_to_requests(context, session: requests.Session):
+    jar = requests.cookies.RequestsCookieJar()
+    for c in context.cookies():
+        jar.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
+    session.cookies = jar
+
+
 def download_with_resume(session: requests.Session, url: str, out_path: Path, referer: str):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".part")
 
     existing = tmp.stat().st_size if tmp.exists() else 0
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; PodkasztUIDownloader/3.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; PodkasztVisitedDownloader/1.0)",
         "Referer": referer,
     }
     if existing > 0:
@@ -394,28 +314,28 @@ def download_with_resume(session: requests.Session, url: str, out_path: Path, re
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default=BASE_URL_DEFAULT)
-    ap.add_argument("--max-pages", type=int, default=3)
-    ap.add_argument("--start-page", type=int, default=1)
-    ap.add_argument("--out", default="podcasts")
-    ap.add_argument("--db", default="podkaszt_ui.sqlite")
-    ap.add_argument("--profile", default=".pw-profile")
+    ap.add_argument("--base-url", default=BASE_URL_DEFAULT) #alap url atallitas, hatha megvaltozik a jövöben az url
+    ap.add_argument("--max-pages", type=int, default=2) #max letoltott oldalak szama
+    ap.add_argument("--start-page", type=int, default=1) #kezdő oldal, hogy ne kelljen mindig 1-től induljon
+    ap.add_argument("--out", default="podcasts") #letöltési mapp a podcastoknak
+    ap.add_argument("--visited", default="podkaszt_visited.txt") #visited file a podcastoknak
+    ap.add_argument("--profile", default=".pw-profile", help="Persistent browser profile folder (stores cookie consent)")
     ap.add_argument("--headful", action="store_true")
-    ap.add_argument("--slowmo", type=int, default=0)
-    ap.add_argument("--force-rescan", action="store_true")
+    ap.add_argument("--slowmo", type=int, default=0, help="ms slow motion for debugging (e.g. 150)")
     ap.add_argument("--audio-wait", type=float, default=12.0)
+    ap.add_argument("--retries", type=int, default=3, help="How many times to attempt getting an audio URL per episode")
     args = ap.parse_args()
 
     base_url = args.base_url if args.base_url.endswith("/") else (args.base_url + "/")
     out_dir = Path(args.out)
-    db_path = Path(args.db)
+    visited_path = Path(args.visited)
     profile_dir = Path(args.profile)
 
-    conn = init_db(db_path)
+    visited = load_visited(visited_path)
 
     print(f"[i] Base:    {base_url}")
-    print(f"[i] DB:      {db_path.resolve()}")
     print(f"[i] Out:     {out_dir.resolve()}")
+    print(f"[i] Visited: {visited_path.resolve()} (loaded {len(visited)})")
     print(f"[i] Profile: {profile_dir.resolve()}")
 
     with sync_playwright() as p:
@@ -427,112 +347,153 @@ def main():
         )
         page = context.pages[0] if context.pages else context.new_page()
 
+        # capture audio URLs from network responses (fallback)
+        last_audio_from_net = {"url": None}
+
+        def on_response(resp):
+            try:
+                u = resp.url
+                base = u.lower().split("?")[0]
+                if any(base.endswith(ext) for ext in AUDIO_EXTS):
+                    last_audio_from_net["url"] = u
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
         session = requests.Session()
 
-        # Open page 1
+        # Open base page & accept cookies
         page.goto(base_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(900)
         if accept_cookies_if_present(page):
             print("[i] Cookie consent accepted.")
 
-        # If start-page > 1, click through pages sequentially until reaching it
+        # Navigate to start page by clicking numbers (1 -> 2 -> ... -> start_page)
         current = 1
         while current < args.start_page:
             ok = click_page_number(page, current + 1)
             if not ok:
-                raise RuntimeError(f"Could not click pagination to reach page {current+1}")
+                raise RuntimeError(f"Could not click pagination number {current+1} to reach start-page")
             accept_cookies_if_present(page)
+            page.wait_for_timeout(600)
             current += 1
 
-        # Main loop: process page_no, then click to next page number
+        # Process pages start_page..max_pages
         for page_no in range(args.start_page, args.max_pages + 1):
-            if (not args.force_rescan) and is_page_scanned(conn, page_no):
-                print(f"[i] Page {page_no}: already scanned, skipping")
-            else:
-                accept_cookies_if_present(page)
+            accept_cookies_if_present(page)
+            page.wait_for_timeout(300)
 
-                table = find_table(page)
-                if not table:
-                    print(f"[!] Page {page_no}: table not found.")
-                    break
+            table = find_table(page)
+            if not table:
+                raise RuntimeError(f"Table not found on page {page_no}")
 
-                hm = header_map(table)
-                title_i, prod_i, date_i = hm["title"], hm["producer"], hm["date"]
-                if title_i is None or prod_i is None or date_i is None:
-                    print(f"[!] Page {page_no}: header map failed. Headers: {hm['headers']}")
-                    break
+            hm = header_map(table)
+            ti, pi, di = hm["title"], hm["producer"], hm["date"]
+            if ti is None or pi is None or di is None:
+                raise RuntimeError(f"Header map failed on page {page_no}. Headers: {hm['headers']}")
 
-                rows = table.locator("tbody tr")
-                n = rows.count()
-                print(f"[i] Page {page_no}: rows={n}")
+            rows = table.locator("tbody tr")
+            n = rows.count()
+            print(f"[i] Page {page_no}: rows={n}")
 
-                for r in range(n):
-                    row = rows.nth(r)
-                    tds = row.locator("td")
-                    if tds.count() <= max(title_i, prod_i, date_i):
-                        continue
+            for r in range(n):
+                row = rows.nth(r)
+                tds = row.locator("td")
+                if tds.count() <= max(ti, pi, di):
+                    continue
 
-                    title = tds.nth(title_i).inner_text().strip()
-                    producer = tds.nth(prod_i).inner_text().strip()
-                    date = tds.nth(date_i).inner_text().strip()
+                title = tds.nth(ti).inner_text().strip()
+                producer = tds.nth(pi).inner_text().strip()
+                date = tds.nth(di).inner_text().strip()
 
-                    if not title or not producer or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
-                        continue
+                if not title or not producer or not date:
+                    continue
 
-                    episode_key = sha1(f"{title}|{producer}|{date}")
-                    upsert_episode(conn, episode_key, title, producer, date)
+                episode_key = sha1(f"{title}|{producer}|{date}")
 
-                    if is_downloaded(conn, episode_key):
-                        continue
+                # Skip if visited
+                if episode_key in visited:
+                    continue
 
-                    # Select episode by clicking title
-                    try:
-                        tds.nth(title_i).click(timeout=2500)
-                    except Exception as e:
-                        mark_status(conn, episode_key, "error", error=f"title_click_failed: {e}")
-                        continue
+                # Also skip if file already exists (and mark visited)
+                # (filename depends on url ext, but we can only know ext after audio_url;
+                # still, if user previously downloaded with same naming scheme, visited file will have it.)
+                # We'll proceed normally.
 
-                    # Start playback: clicking the first column usually triggers play (icon column)
+                # Select by clicking title
+                try:
+                    tds.nth(ti).click(timeout=2500)
+                except Exception as e:
+                    print(f"[!] select failed: {producer} | {title} | {date} -> {e}")
+                    continue
+
+                # Try to start playback by clicking the icon column
+                try:
+                    tds.nth(0).click(timeout=1500)
+                except Exception:
+                    pass
+
+                page.wait_for_timeout(700)
+
+                # Try to obtain audio URL (currentSrc + network), with retries
+                audio_url = None
+                last_audio_from_net["url"] = None
+
+                for attempt in range(1, max(1, args.retries) + 1):
+                    audio_url = get_audio_url_from_player(page, wait_s=args.audio_wait)
+                    if audio_url and not audio_url.startswith("blob:"):
+                        break
+
+                    # network fallback
+                    if last_audio_from_net["url"]:
+                        audio_url = last_audio_from_net["url"]
+                        break
+
+                    # nudge playback again
                     try:
                         tds.nth(0).click(timeout=1500)
                     except Exception:
                         pass
+                    page.wait_for_timeout(500)
 
-                    page.wait_for_timeout(600)
+                if not audio_url:
+                    print(f"[!] no_audio: {producer} | {title} | {date}")
+                    continue
 
-                    # Read currentSrc and download it (equivalent to the native Download menu)
-                    audio_url = get_audio_url_from_player(page, wait_s=args.audio_wait)
-                    if not audio_url:
-                        mark_status(conn, episode_key, "no_audio", error="No audio currentSrc/src found (blob/stream?).")
-                        print(f"[!] no_audio: {producer} | {title} | {date}")
-                        continue
+                # Sync cookies before downloading (important for some hosts)
+                try:
+                    sync_cookies_to_requests(context, session)
+                except Exception:
+                    pass
 
-                    ext = guess_ext_from_url(audio_url)
-                    filename = f"{slugify(producer)} - {slugify(title)} - {date} [{episode_key[:10]}]{ext}"
-                    out_path = out_dir / filename
+                ext = guess_ext_from_url(audio_url)
+                filename = f"{slugify(producer)} - {slugify(title)} - {date} [{episode_key[:10]}]{ext}"
+                out_path = out_dir / filename
 
-                    if out_path.exists() and out_path.stat().st_size > 0:
-                        mark_status(conn, episode_key, "downloaded", audio_url=audio_url, filename=str(out_path))
-                        continue
+                # If already exists, mark visited and skip
+                if out_path.exists() and out_path.stat().st_size > 0:
+                    visited.add(episode_key)
+                    append_visited(visited_path, episode_key, date, producer, title)
+                    print(f"[i] already exists -> visited: {out_path.name}")
+                    continue
 
-                    try:
-                        print(f"[+] downloading: {filename}")
-                        download_with_resume(session, audio_url, out_path, referer=base_url)
-                        mark_status(conn, episode_key, "downloaded", audio_url=audio_url, filename=str(out_path))
-                    except Exception as e:
-                        mark_status(conn, episode_key, "error", audio_url=audio_url, error=str(e))
-                        print(f"[!] download error: {e}")
+                try:
+                    print(f"[+] downloading: {out_path.name}")
+                    download_with_resume(session, audio_url, out_path, referer=base_url)
+                    visited.add(episode_key)
+                    append_visited(visited_path, episode_key, date, producer, title)
+                except Exception as e:
+                    print(f"[!] download error: {producer} | {title} | {date} -> {e}")
 
-                    page.wait_for_timeout(250)
+                page.wait_for_timeout(250)
 
-                mark_page_scanned(conn, page_no)
-
-            # Move to next page by clicking the next number
+            # go next page by clicking the next number
             if page_no < args.max_pages:
                 ok = click_page_number(page, page_no + 1)
                 if not ok:
                     raise RuntimeError(f"Could not click pagination number {page_no+1}")
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(700)
 
         context.close()
 
