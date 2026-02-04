@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import os
 import re
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -14,7 +13,7 @@ from urllib.parse import urlparse
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError
 
-BASE_URL_DEFAULT = "https://podkaszt.hu/adasok/uj/" # podcastok 20 oldalanként 3500 oldal
+BASE_URL_DEFAULT = "https://podkaszt.hu/adasok/uj/"  # podcastok 20 oldalanként 3500 oldal
 AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav")
 
 COOKIE_ACCEPT_REGEX = re.compile(r"(Beleegyezés|Elfogadom|Accept|Agree|Allow)", re.I)
@@ -28,11 +27,18 @@ def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def slugify(name: str, max_len: int = 180) -> str:
+def slugify(name: str, max_len: int = 4000) -> str:
+    """
+    Fájlnévben nem megengedett karakterek cseréje.
+    Fontos: itt NEM a fájlrendszer-limitet kezeljük, csak tisztítunk.
+    A tényleges hossz/byte-limitet build_safe_filename() intézi, '___' suffix-szel.
+    """
     name = (name or "").strip()
     name = re.sub(r"\s+", " ", name)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
     name = name.strip(" ._")
+
+    # csak egy "védőkorlát", hogy ne nőjön végtelenre a string
     if len(name) > max_len:
         name = name[:max_len].rstrip(" ._")
     return name or "untitled"
@@ -179,7 +185,7 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
                         "  return txt.length>0 && txt !== prev;"
                         "}",
                         before,
-                        timeout=wait_timeout_ms
+                        timeout=wait_timeout_ms,
                     )
                 except Exception:
                     page.wait_for_timeout(900)
@@ -245,7 +251,7 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
             "  return txt.length>0 && txt !== prev;"
             "}",
             before,
-            timeout=wait_timeout_ms
+            timeout=wait_timeout_ms,
         )
     except Exception:
         page.wait_for_timeout(900)
@@ -257,7 +263,7 @@ def get_audio_url_from_player(page, wait_s: float = 12.0) -> Optional[str]:
     try:
         page.wait_for_function(
             "() => { const m=document.querySelector('audio,video'); return m && (m.currentSrc || m.src) && (m.currentSrc || m.src).length>0; }",
-            timeout=int(wait_s * 1000)
+            timeout=int(wait_s * 1000),
         )
         url = page.evaluate(
             "() => { const m=document.querySelector('audio,video'); return m ? (m.currentSrc || m.src) : null; }"
@@ -312,13 +318,102 @@ def download_with_resume(session: requests.Session, url: str, out_path: Path, re
     tmp.replace(out_path)
 
 
+# --------- ÚJ: fájlnév-hossz kezelése (byte-alapon) ---------
+
+def get_name_max(dir_path: Path, fallback: int = 255) -> int:
+    """
+    Filesystem limit for a single filename component (NAME_MAX).
+    Tipikusan 255 byte Linuxon.
+    """
+    try:
+        return int(os.pathconf(str(dir_path), "PC_NAME_MAX"))
+    except Exception:
+        return fallback
+
+
+def get_path_max(dir_path: Path, fallback: int = 4096) -> int:
+    """
+    Filesystem limit for full path length (PATH_MAX).
+    Tipikusan 4096 byte Linuxon.
+    """
+    try:
+        return int(os.pathconf(str(dir_path), "PC_PATH_MAX"))
+    except Exception:
+        return fallback
+
+
+def trim_utf8_to_bytes(text: str, max_bytes: int, suffix: str = "___") -> str:
+    """
+    Trim string so that utf-8 byte length <= max_bytes.
+    If trimming happens, append suffix (also counted in max_bytes).
+    """
+    if max_bytes <= 0:
+        return ""
+
+    b = (text or "").encode("utf-8", errors="ignore")
+    if len(b) <= max_bytes:
+        return text or ""
+
+    suf_b = suffix.encode("utf-8", errors="ignore")
+    if len(suf_b) >= max_bytes:
+        # Edge-case: suffix sem fér be; best effort
+        return suf_b[:max_bytes].decode("utf-8", errors="ignore")
+
+    cut = max_bytes - len(suf_b)
+    trimmed = b[:cut].decode("utf-8", errors="ignore")
+    trimmed = trimmed.rstrip(" ._-")
+    return trimmed + suffix
+
+
+def build_safe_filename(out_dir: Path, producer: str, title: str, date: str, episode_key: str, ext: str) -> str:
+    """
+    Olyan fájlnevet épít, ami:
+    - tisztított (slugify)
+    - NAME_MAX-ot (filename komponens) nem lépi túl byte-ban
+    - ha vágni kell, '___' kerül a végére (kiterjesztés elé)
+    - plusz figyel a PATH_MAX-ra is (ritkább, de létező gond)
+    """
+    ext = (ext or "").lower()
+    if ext not in AUDIO_EXTS:
+        ext = ".mp3"
+
+    # Slugify (itt nem a limit a lényeg, hanem a tisztítás)
+    producer_s = slugify(producer, max_len=4000)
+    title_s = slugify(title, max_len=8000)
+
+    key10 = (episode_key or "")[:10]
+    stem = f"{producer_s} - {title_s} - {date} [{key10}]"
+
+    name_max = get_name_max(out_dir)
+    ext_bytes = len(ext.encode("utf-8", errors="ignore"))
+    max_stem_bytes = max(1, name_max - ext_bytes)
+
+    safe_stem = trim_utf8_to_bytes(stem, max_stem_bytes, suffix="___")
+    filename = safe_stem + ext
+
+    # EXTRA: PATH_MAX védelem (teljes útvonal hossz)
+    # Ha a teljes path mégis túl hosszú lenne (nagyon hosszú out_dir esetén), vágunk tovább.
+    path_max = get_path_max(out_dir)
+    full_path_bytes = len(str(out_dir / filename).encode("utf-8", errors="ignore"))
+    if full_path_bytes > path_max:
+        # Mennyi férne bele a stem-ből?
+        # approx: path_max - len(out_dir + os.sep) - len(ext)
+        prefix_bytes = len((str(out_dir) + os.sep).encode("utf-8", errors="ignore"))
+        max_filename_bytes = max(1, path_max - prefix_bytes)
+        max_stem_bytes2 = max(1, max_filename_bytes - ext_bytes)
+        safe_stem2 = trim_utf8_to_bytes(stem, max_stem_bytes2, suffix="___")
+        filename = safe_stem2 + ext
+
+    return filename
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default=BASE_URL_DEFAULT) #alap url atallitas, hatha megvaltozik a jövöben az url
-    ap.add_argument("--max-pages", type=int, default=2) #max letoltott oldalak szama
-    ap.add_argument("--start-page", type=int, default=1) #kezdő oldal, hogy ne kelljen mindig 1-től induljon
-    ap.add_argument("--out", default="podcasts") #letöltési mapp a podcastoknak
-    ap.add_argument("--visited", default="podkaszt_visited.txt") #visited file a podcastoknak
+    ap.add_argument("--base-url", default=BASE_URL_DEFAULT)  # alap url atallitas, hatha megvaltozik a jövöben az url
+    ap.add_argument("--max-pages", type=int, default=2)  # max letoltott oldalak szama
+    ap.add_argument("--start-page", type=int, default=1)  # kezdő oldal, hogy ne kelljen mindig 1-től induljon
+    ap.add_argument("--out", default="podcasts")  # letöltési mappa a podcastoknak
+    ap.add_argument("--visited", default="podkaszt_visited.txt")  # visited file a podcastoknak
     ap.add_argument("--profile", default=".pw-profile", help="Persistent browser profile folder (stores cookie consent)")
     ap.add_argument("--headful", action="store_true")
     ap.add_argument("--slowmo", type=int, default=0, help="ms slow motion for debugging (e.g. 150)")
@@ -330,6 +425,9 @@ def main():
     out_dir = Path(args.out)
     visited_path = Path(args.visited)
     profile_dir = Path(args.profile)
+
+    # fontos: out_dir létezzen, különben a pathconf néha nem megbízható
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     visited = load_visited(visited_path)
 
@@ -416,11 +514,6 @@ def main():
                 if episode_key in visited:
                     continue
 
-                # Also skip if file already exists (and mark visited)
-                # (filename depends on url ext, but we can only know ext after audio_url;
-                # still, if user previously downloaded with same naming scheme, visited file will have it.)
-                # We'll proceed normally.
-
                 # Select by clicking title
                 try:
                     tds.nth(ti).click(timeout=2500)
@@ -468,7 +561,9 @@ def main():
                     pass
 
                 ext = guess_ext_from_url(audio_url)
-                filename = f"{slugify(producer)} - {slugify(title)} - {date} [{episode_key[:10]}]{ext}"
+
+                # ÚJ: fájlnév biztonságos építése (ha túl hosszú, '___'-t kap)
+                filename = build_safe_filename(out_dir, producer, title, date, episode_key, ext)
                 out_path = out_dir / filename
 
                 # If already exists, mark visited and skip
