@@ -65,6 +65,14 @@ def append_visited(path: Path, episode_key: str, date: str, producer: str, title
         f.write(line)
 
 
+def append_timeout(path: Path, filename: str, date: str, producer: str, title: str, episode_key: str, reason: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reason = (reason or "").replace("\n", " ").replace("\r", " ").strip()
+    line = f"{filename}\t{date}\t{producer}\t{title}\t{episode_key}\t{reason}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
 def accept_cookies_if_present(page) -> bool:
     # main document
     try:
@@ -461,6 +469,7 @@ def main():
     out_dir = Path(args.out)
     visited_path = Path(args.visited)
     profile_dir = Path(args.profile)
+    timeouts_path = Path("timeouts.txt")
 
     # fontos: out_dir létezzen, különben a pathconf néha nem megbízható
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -531,6 +540,9 @@ def main():
             n = rows.count()
             print(f"[i] Page {page_no}: rows={n}")
 
+            page_candidates = 0
+            page_ok = 0
+
             for r in range(n):
                 row = rows.nth(r)
                 tds = row.locator("td")
@@ -550,11 +562,15 @@ def main():
                 if episode_key in visited:
                     continue
 
+                page_candidates += 1
+
                 # Select by clicking title
                 try:
                     tds.nth(ti).click(timeout=2500)
                 except Exception as e:
                     print(f"[!] select failed: {producer} | {title} | {date} -> {e}")
+                    filename_nf = build_safe_filename(out_dir, producer, title, date, episode_key, ".mp3")
+                    append_timeout(timeouts_path, filename_nf, date, producer, title, episode_key, f"select failed: {e}")
                     continue
 
                 # Try to start playback by clicking the icon column
@@ -588,6 +604,8 @@ def main():
 
                 if not audio_url:
                     print(f"[!] no_audio: {producer} | {title} | {date}")
+                    filename_nf = build_safe_filename(out_dir, producer, title, date, episode_key, ".mp3")
+                    append_timeout(timeouts_path, filename_nf, date, producer, title, episode_key, "no_audio")
                     continue
 
                 # Sync cookies before downloading (important for some hosts)
@@ -620,9 +638,11 @@ def main():
                     visited.add(episode_key)
                     append_visited(visited_path, episode_key, date, producer, title)
                     print(f"[i] already exists -> visited: {out_path.name}")
+                    page_ok += 1
                     continue
 
                 downloaded_ok = False
+                last_err = ""
                 for _fs_try in range(6):
                     try:
                         print(f"[+] downloading: {out_path.name}")
@@ -636,29 +656,22 @@ def main():
                             print("fallback: fajlnev tul hosszu, rovidites")
                             filename = halve_filename_fallback(out_dir, filename)
                             out_path = out_dir / filename
-
-                            try:
-                                if out_path.exists() and out_path.stat().st_size > 0:
-                                    visited.add(episode_key)
-                                    append_visited(visited_path, episode_key, date, producer, title)
-                                    print(f"[i] already exists -> visited: {out_path.name}")
-                                    downloaded_ok = True
-                                    break
-                            except OSError as e2:
-                                if getattr(e2, "errno", None) == 36:
-                                    continue
-                                raise
-
                             continue
-                        raise
+                        last_err = f"OSError: {e}"
+                        break
                     except Exception as e:
+                        last_err = str(e)
                         print(f"[!] download error: {producer} | {title} | {date} -> {e}")
                         break
 
-                if not downloaded_ok:
-                    pass
+                if downloaded_ok:
+                    page_ok += 1
+                else:
+                    append_timeout(timeouts_path, out_path.name, date, producer, title, episode_key, last_err or "download failed")
 
                 page.wait_for_timeout(250)
+
+            print(f"letoltve {page_ok}/{page_candidates}")
 
             # go next page by clicking the next number
             if page_no < args.max_pages:
@@ -674,6 +687,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-#TODO timouts mappa
-#TODO irja ki, hogy a 20 bol hanyat tudott letölteni az adott oldalrol
