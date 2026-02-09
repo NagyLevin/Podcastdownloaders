@@ -568,9 +568,10 @@ def main():
                 try:
                     tds.nth(ti).click(timeout=2500)
                 except Exception as e:
-                    print(f"[!] select failed: {producer} | {title} | {date} -> {e}")
+                    reason = f"select failed: {e}"
+                    print(f"[!] failed: {producer} | {title} | {date} -> {reason}")
                     filename_nf = build_safe_filename(out_dir, producer, title, date, episode_key, ".mp3")
-                    append_timeout(timeouts_path, filename_nf, date, producer, title, episode_key, f"select failed: {e}")
+                    append_timeout(timeouts_path, filename_nf, date, producer, title, episode_key, reason)
                     continue
 
                 # Try to start playback by clicking the icon column
@@ -603,9 +604,10 @@ def main():
                     page.wait_for_timeout(500)
 
                 if not audio_url:
-                    print(f"[!] no_audio: {producer} | {title} | {date}")
+                    reason = "no_audio"
+                    print(f"[!] failed: {producer} | {title} | {date} -> {reason}")
                     filename_nf = build_safe_filename(out_dir, producer, title, date, episode_key, ".mp3")
-                    append_timeout(timeouts_path, filename_nf, date, producer, title, episode_key, "no_audio")
+                    append_timeout(timeouts_path, filename_nf, date, producer, title, episode_key, reason)
                     continue
 
                 # Sync cookies before downloading (important for some hosts)
@@ -661,13 +663,14 @@ def main():
                         break
                     except Exception as e:
                         last_err = str(e)
-                        print(f"[!] download error: {producer} | {title} | {date} -> {e}")
                         break
 
                 if downloaded_ok:
                     page_ok += 1
                 else:
-                    append_timeout(timeouts_path, out_path.name, date, producer, title, episode_key, last_err or "download failed")
+                    reason = last_err or "download failed"
+                    print(f"[!] failed: {producer} | {title} | {date} -> {reason}")
+                    append_timeout(timeouts_path, out_path.name, date, producer, title, episode_key, reason)
 
                 page.wait_for_timeout(250)
 
