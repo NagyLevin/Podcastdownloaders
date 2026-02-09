@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import argparse
 import hashlib
 import os
@@ -15,6 +12,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError
 
 BASE_URL_DEFAULT = "https://podkaszt.hu/adasok/uj/"  # podcastok 20 oldalanként 3500 oldal
 AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav")
+TMP_SUFFIX = ".part"
 
 COOKIE_ACCEPT_REGEX = re.compile(r"(Beleegyezés|Elfogadom|Accept|Agree|Allow)", re.I)
 
@@ -293,7 +291,7 @@ def sync_cookies_to_requests(context, session: requests.Session):
 
 def download_with_resume(session: requests.Session, url: str, out_path: Path, referer: str):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_suffix(out_path.suffix + ".part")
+    tmp = out_path.with_suffix(out_path.suffix + TMP_SUFFIX)
 
     existing = tmp.stat().st_size if tmp.exists() else 0
     headers = {
@@ -385,8 +383,8 @@ def build_safe_filename(out_dir: Path, producer: str, title: str, date: str, epi
     stem = f"{producer_s} - {title_s} - {date} [{key10}]"
 
     name_max = get_name_max(out_dir)
-    ext_bytes = len(ext.encode("utf-8", errors="ignore"))
-    max_stem_bytes = max(1, name_max - ext_bytes)
+    tail_bytes = len((ext + TMP_SUFFIX).encode("utf-8", errors="ignore"))
+    max_stem_bytes = max(1, name_max - tail_bytes)
 
     safe_stem = trim_utf8_to_bytes(stem, max_stem_bytes, suffix="___")
     filename = safe_stem + ext
@@ -395,16 +393,54 @@ def build_safe_filename(out_dir: Path, producer: str, title: str, date: str, epi
     # Ha a teljes path mégis túl hosszú lenne (nagyon hosszú out_dir esetén), vágunk tovább.
     path_max = get_path_max(out_dir)
     full_path_bytes = len(str(out_dir / filename).encode("utf-8", errors="ignore"))
-    if full_path_bytes > path_max:
+    full_tmp_path_bytes = len(str(out_dir / (filename + TMP_SUFFIX)).encode("utf-8", errors="ignore"))
+    if full_path_bytes > path_max or full_tmp_path_bytes > path_max:
         # Mennyi férne bele a stem-ből?
         # approx: path_max - len(out_dir + os.sep) - len(ext)
         prefix_bytes = len((str(out_dir) + os.sep).encode("utf-8", errors="ignore"))
         max_filename_bytes = max(1, path_max - prefix_bytes)
-        max_stem_bytes2 = max(1, max_filename_bytes - ext_bytes)
+        max_stem_bytes2 = max(1, max_filename_bytes - tail_bytes)
         safe_stem2 = trim_utf8_to_bytes(stem, max_stem_bytes2, suffix="___")
         filename = safe_stem2 + ext
 
     return filename
+
+
+def halve_filename_fallback(out_dir: Path, filename: str) -> str:
+    stem, ext = os.path.splitext(filename)
+    if not ext:
+        ext = ".mp3"
+    if ext.lower() not in AUDIO_EXTS:
+        ext = ".mp3"
+
+    # ha már volt rajta jelölés, ne halmozzuk
+    base_stem = stem
+    if base_stem.endswith("___"):
+        base_stem = base_stem[:-3].rstrip(" ._-")
+
+    b = base_stem.encode("utf-8", errors="ignore")
+    half_bytes = max(1, len(b) // 2)
+
+    name_max = get_name_max(out_dir)
+    tail_bytes = len((ext + TMP_SUFFIX).encode("utf-8", errors="ignore"))
+    max_stem_bytes = max(1, name_max - tail_bytes)
+
+    target_bytes = min(half_bytes, max_stem_bytes)
+    safe_stem = trim_utf8_to_bytes(base_stem, target_bytes, suffix="___")
+    new_filename = safe_stem + ext
+
+    path_max = get_path_max(out_dir)
+    full_path_bytes = len(str(out_dir / new_filename).encode("utf-8", errors="ignore"))
+    full_tmp_path_bytes = len(str(out_dir / (new_filename + TMP_SUFFIX)).encode("utf-8", errors="ignore"))
+    if full_path_bytes > path_max or full_tmp_path_bytes > path_max:
+        prefix_bytes = len((str(out_dir) + os.sep).encode("utf-8", errors="ignore"))
+        max_filename_bytes = max(1, path_max - prefix_bytes)
+        max_stem_bytes2 = max(1, max_filename_bytes - tail_bytes)
+        target_bytes2 = min(target_bytes, max_stem_bytes2)
+        safe_stem2 = trim_utf8_to_bytes(base_stem, target_bytes2, suffix="___")
+        new_filename = safe_stem2 + ext
+
+    return new_filename
 
 
 def main():
@@ -567,19 +603,60 @@ def main():
                 out_path = out_dir / filename
 
                 # If already exists, mark visited and skip
-                if out_path.exists() and out_path.stat().st_size > 0:
+                exists_nonempty = False
+                for _fs_try in range(6):
+                    try:
+                        exists_nonempty = out_path.exists() and out_path.stat().st_size > 0
+                        break
+                    except OSError as e:
+                        if getattr(e, "errno", None) == 36:
+                            print("fallback: fajlnev tul hosszu, rovidites")
+                            filename = halve_filename_fallback(out_dir, filename)
+                            out_path = out_dir / filename
+                            continue
+                        raise
+
+                if exists_nonempty:
                     visited.add(episode_key)
                     append_visited(visited_path, episode_key, date, producer, title)
                     print(f"[i] already exists -> visited: {out_path.name}")
                     continue
 
-                try:
-                    print(f"[+] downloading: {out_path.name}")
-                    download_with_resume(session, audio_url, out_path, referer=base_url)
-                    visited.add(episode_key)
-                    append_visited(visited_path, episode_key, date, producer, title)
-                except Exception as e:
-                    print(f"[!] download error: {producer} | {title} | {date} -> {e}")
+                downloaded_ok = False
+                for _fs_try in range(6):
+                    try:
+                        print(f"[+] downloading: {out_path.name}")
+                        download_with_resume(session, audio_url, out_path, referer=base_url)
+                        visited.add(episode_key)
+                        append_visited(visited_path, episode_key, date, producer, title)
+                        downloaded_ok = True
+                        break
+                    except OSError as e:
+                        if getattr(e, "errno", None) == 36:
+                            print("fallback: fajlnev tul hosszu, rovidites")
+                            filename = halve_filename_fallback(out_dir, filename)
+                            out_path = out_dir / filename
+
+                            try:
+                                if out_path.exists() and out_path.stat().st_size > 0:
+                                    visited.add(episode_key)
+                                    append_visited(visited_path, episode_key, date, producer, title)
+                                    print(f"[i] already exists -> visited: {out_path.name}")
+                                    downloaded_ok = True
+                                    break
+                            except OSError as e2:
+                                if getattr(e2, "errno", None) == 36:
+                                    continue
+                                raise
+
+                            continue
+                        raise
+                    except Exception as e:
+                        print(f"[!] download error: {producer} | {title} | {date} -> {e}")
+                        break
+
+                if not downloaded_ok:
+                    pass
 
                 page.wait_for_timeout(250)
 
@@ -597,3 +674,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#TODO timouts mappa
+#TODO irja ki, hogy a 20 bol hanyat tudott letölteni az adott oldalrol
