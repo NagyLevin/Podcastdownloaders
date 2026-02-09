@@ -265,6 +265,36 @@ def click_page_number(page, target_page: int, wait_timeout_ms: int = 20000) -> b
     return True
 
 
+def try_goto_page_by_url(page, base_url: str, target_page: int) -> bool:
+    """
+    URL-es fallback, ha a pagination kattintás nem működik.
+    Több gyakori mintát kipróbál.
+    """
+    before = get_first_row_signature(page)
+
+    candidates = [
+        f"{base_url}?page={target_page}",
+        f"{base_url}?p={target_page}",
+        f"{base_url}{target_page}/",
+        f"{base_url}page/{target_page}/",
+        f"{base_url}oldal/{target_page}/",
+    ]
+
+    for u in candidates:
+        try:
+            page.goto(u, wait_until="domcontentloaded", timeout=25000)
+            page.wait_for_timeout(700)
+            accept_cookies_if_present(page)
+
+            after = get_first_row_signature(page)
+            if after and after != before:
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 def get_audio_url_from_player(page, wait_s: float = 12.0) -> Optional[str]:
     try:
         page.wait_for_function(
@@ -454,8 +484,8 @@ def halve_filename_fallback(out_dir: Path, filename: str) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default=BASE_URL_DEFAULT)  # alap url atallitas, hatha megvaltozik a jövöben az url
-    ap.add_argument("--max-pages", type=int, default=2)  # max letoltott oldalak szama
     ap.add_argument("--start-page", type=int, default=1)  # kezdő oldal, hogy ne kelljen mindig 1-től induljon
+    ap.add_argument("--end-page", type=int, default=2)  # max letoltott oldalak szama
     ap.add_argument("--out", default="podcasts")  # letöltési mappa a podcastoknak
     ap.add_argument("--visited", default="podkaszt_visited.txt")  # visited file a podcastoknak
     ap.add_argument("--profile", default=".pw-profile", help="Persistent browser profile folder (stores cookie consent)")
@@ -514,16 +544,36 @@ def main():
 
         # Navigate to start page by clicking numbers (1 -> 2 -> ... -> start_page)
         current = 1
-        while current < args.start_page:
-            ok = click_page_number(page, current + 1)
-            if not ok:
-                raise RuntimeError(f"Could not click pagination number {current+1} to reach start-page")
-            accept_cookies_if_present(page)
-            page.wait_for_timeout(600)
-            current += 1
+        if args.start_page > 1:
+            print(f"[i] skipping to start-page {args.start_page} ...")
 
-        # Process pages start_page..max_pages
-        for page_no in range(args.start_page, args.max_pages + 1):
+        while current < args.start_page:
+            target = current + 1
+            ok = click_page_number(page, target)
+            if not ok:
+                ok = try_goto_page_by_url(page, base_url, target)
+
+            if not ok:
+                # retry párszor, mert nagy oldalszámnál random szokott lenni
+                retry_ok = False
+                for _ in range(3):
+                    page.wait_for_timeout(1200)
+                    ok2 = click_page_number(page, target)
+                    if not ok2:
+                        ok2 = try_goto_page_by_url(page, base_url, target)
+                    if ok2:
+                        retry_ok = True
+                        break
+                if not retry_ok:
+                    raise RuntimeError(f"Could not click pagination number {target} to reach start-page")
+
+            accept_cookies_if_present(page)
+            page.wait_for_timeout(350)
+            current = target
+            print(f"skipped to page {current}")
+
+        # Process pages start_page..end_page
+        for page_no in range(args.start_page, args.end_page + 1):
             accept_cookies_if_present(page)
             page.wait_for_timeout(300)
 
@@ -677,10 +727,23 @@ def main():
             print(f"letoltve {page_ok}/{page_candidates}")
 
             # go next page by clicking the next number
-            if page_no < args.max_pages:
+            if page_no < args.end_page:
                 ok = click_page_number(page, page_no + 1)
                 if not ok:
-                    raise RuntimeError(f"Could not click pagination number {page_no+1}")
+                    ok = try_goto_page_by_url(page, base_url, page_no + 1)
+                if not ok:
+                    # retry párszor
+                    retry_ok = False
+                    for _ in range(3):
+                        page.wait_for_timeout(1200)
+                        ok2 = click_page_number(page, page_no + 1)
+                        if not ok2:
+                            ok2 = try_goto_page_by_url(page, base_url, page_no + 1)
+                        if ok2:
+                            retry_ok = True
+                            break
+                    if not retry_ok:
+                        raise RuntimeError(f"Could not click pagination number {page_no+1}")
                 page.wait_for_timeout(700)
 
         context.close()
