@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -19,6 +20,32 @@ COOKIE_ACCEPT_REGEX = re.compile(r"(Beleegyezés|Elfogadom|Accept|Agree|Allow)",
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def local_ts() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def fmt_bytes(n: float) -> str:
+    n = float(n)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while n >= 1024.0 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(n)}{units[i]}"
+    return f"{n:.1f}{units[i]}"
 
 
 def sha1(s: str) -> str:
@@ -327,7 +354,50 @@ def sync_cookies_to_requests(context, session: requests.Session):
     session.cookies = jar
 
 
-def download_with_resume(session: requests.Session, url: str, out_path: Path, referer: str):
+def get_total_size_bytes(existing: int, r: requests.Response) -> Optional[int]:
+    """
+    Visszaadja a teljes fájlméretet byte-ban, ha kiszedhető a headerből.
+    Range-es letöltésnél Content-Range a legjobb (bytes a-b/TOTAL).
+    """
+    cr = r.headers.get("Content-Range")
+    if cr:
+        # pl: "bytes 123-999/1000"
+        m = re.search(r"/(\d+)\s*$", cr)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+
+    cl = r.headers.get("Content-Length")
+    if cl:
+        try:
+            clen = int(cl)
+            # Ha 206 (partial content), a Content-Length a "maradék", tehát total = existing + remaining
+            if r.status_code == 206:
+                return existing + clen
+            return clen
+        except Exception:
+            pass
+
+    return None
+
+
+def download_with_resume(
+    session: requests.Session,
+    url: str,
+    out_path: Path,
+    referer: str,
+    progress_label: str = "",
+):
+    """
+    Letöltés resume-mal + élő progress:
+    - százalék (ha ismert a total)
+    - letöltött/összes
+    - sebesség
+    - ETA
+    - start/end timestamp + elapsed
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + TMP_SUFFIX)
 
@@ -339,19 +409,75 @@ def download_with_resume(session: requests.Session, url: str, out_path: Path, re
     if existing > 0:
         headers["Range"] = f"bytes={existing}-"
 
+    started_at = local_ts()
+    t0 = time.monotonic()
+
     r = session.get(url, stream=True, timeout=60, allow_redirects=True, headers=headers)
+
     mode = "ab" if (existing > 0 and r.status_code == 206) else "wb"
-    if mode == "wb" and tmp.exists():
-        tmp.unlink(missing_ok=True)
+    if mode == "wb":
+        existing = 0  # újrakezdjük
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
     r.raise_for_status()
 
+    total = get_total_size_bytes(existing, r)  # lehet None
+    downloaded = existing
+    session_bytes = 0  # az aktuális futásban letöltött byte (resume-nál fontos)
+
+    last_print = 0.0
+    label = (progress_label or out_path.name or "download").strip()
+
+    print(f"[i] download start: {started_at} | {label}")
+
     with open(tmp, mode) as f:
         for chunk in r.iter_content(chunk_size=1024 * 256):
-            if chunk:
-                f.write(chunk)
+            if not chunk:
+                continue
+            f.write(chunk)
+
+            downloaded += len(chunk)
+            session_bytes += len(chunk)
+
+            now = time.monotonic()
+            elapsed = max(0.001, now - t0)
+            speed = session_bytes / elapsed  # B/s
+
+            # ne frissítsünk túl gyakran
+            if (now - last_print) < 0.25:
+                continue
+            last_print = now
+
+            if total and total > 0:
+                pct = (downloaded / total) * 100.0
+                remain = max(0, total - downloaded)
+                eta = (remain / speed) if speed > 1e-9 else 0.0
+                msg = (
+                    f"\r{pct:6.2f}%  {fmt_bytes(downloaded)}/{fmt_bytes(total)}"
+                    f"  {fmt_bytes(speed)}/s  ETA {fmt_duration(eta)}  | {label}"
+                )
+            else:
+                msg = f"\r{fmt_bytes(downloaded)}  {fmt_bytes(speed)}/s  | {label}"
+
+            print(msg, end="", flush=True)
 
     tmp.replace(out_path)
+
+    finished_at = local_ts()
+    total_elapsed = time.monotonic() - t0
+    avg_speed = session_bytes / max(0.001, total_elapsed)
+
+    # zárjuk le a progress sort szépen
+    if total and total > 0:
+        print(
+            f"\r100.00%  {fmt_bytes(downloaded)}/{fmt_bytes(total)}  "
+            f"{fmt_bytes(avg_speed)}/s  ETA 00:00  | {label}"
+        )
+    else:
+        print()
+
+    print(f"[i] download end:   {finished_at} | {label} | elapsed {fmt_duration(total_elapsed)}")
 
 
 # --------- ÚJ: fájlnév-hossz kezelése (byte-alapon) ---------
@@ -428,13 +554,10 @@ def build_safe_filename(out_dir: Path, producer: str, title: str, date: str, epi
     filename = safe_stem + ext
 
     # EXTRA: PATH_MAX védelem (teljes útvonal hossz)
-    # Ha a teljes path mégis túl hosszú lenne (nagyon hosszú out_dir esetén), vágunk tovább.
     path_max = get_path_max(out_dir)
     full_path_bytes = len(str(out_dir / filename).encode("utf-8", errors="ignore"))
     full_tmp_path_bytes = len(str(out_dir / (filename + TMP_SUFFIX)).encode("utf-8", errors="ignore"))
     if full_path_bytes > path_max or full_tmp_path_bytes > path_max:
-        # Mennyi férne bele a stem-ből?
-        # approx: path_max - len(out_dir + os.sep) - len(ext)
         prefix_bytes = len((str(out_dir) + os.sep).encode("utf-8", errors="ignore"))
         max_filename_bytes = max(1, path_max - prefix_bytes)
         max_stem_bytes2 = max(1, max_filename_bytes - tail_bytes)
@@ -483,17 +606,20 @@ def halve_filename_fallback(out_dir: Path, filename: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default=BASE_URL_DEFAULT,help="base url of the podcast website")  # alap url atallitas, hatha megvaltozik a jövöben az url
-    ap.add_argument("--start-page", type=int, default=1, help="start page of the podcast website")  # kezdő oldal, hogy ne kelljen mindig 1-től induljon
-    ap.add_argument("--end-page", type=int, default=2, help="end page of the podcast website")  # max letoltott oldalak szama
-    ap.add_argument("--out", default="podcasts", help="output directory for the podcast files")  # letöltési mappa a podcastoknak
-    ap.add_argument("--visited", default="podkaszt_visited.txt", help="visited file for the podcast files")  # visited file a podcastoknak
+    ap.add_argument("--base-url", default=BASE_URL_DEFAULT, help="base url of the podcast website")
+    ap.add_argument("--start-page", type=int, default=1, help="start page of the podcast website")
+    ap.add_argument("--end-page", type=int, default=2, help="end page of the podcast website")
+    ap.add_argument("--out", default="podcasts", help="output directory for the podcast files")
+    ap.add_argument("--visited", default="podkaszt_visited.txt", help="visited file for the podcast files")
     ap.add_argument("--profile", default=".pw-profile", help="Persistent browser profile folder (stores cookie consent)")
     ap.add_argument("--headful", action="store_true", help="show the browser window for debugging")
     ap.add_argument("--slowmo", type=int, default=0, help="ms slow motion for debugging (e.g. 150)")
     ap.add_argument("--audio-wait", type=float, default=12.0, help="wait time for the audio url")
     ap.add_argument("--retries", type=int, default=3, help="How many times to attempt getting an audio URL per episode")
     args = ap.parse_args()
+
+    run_start = datetime.now().astimezone()
+    print(f"[i] RUN START: {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
 
     base_url = args.base_url if args.base_url.endswith("/") else (args.base_url + "/")
     out_dir = Path(args.out)
@@ -636,7 +762,7 @@ def main():
                 audio_url = None
                 last_audio_from_net["url"] = None
 
-                for attempt in range(1, max(1, args.retries) + 1):
+                for _attempt in range(1, max(1, args.retries) + 1):
                     audio_url = get_audio_url_from_player(page, wait_s=args.audio_wait)
                     if audio_url and not audio_url.startswith("blob:"):
                         break
@@ -668,7 +794,7 @@ def main():
 
                 ext = guess_ext_from_url(audio_url)
 
-                # ÚJ: fájlnév biztonságos építése (ha túl hosszú, '___'-t kap)
+                # fájlnév biztonságos építése (ha túl hosszú, '___'-t kap)
                 filename = build_safe_filename(out_dir, producer, title, date, episode_key, ext)
                 out_path = out_dir / filename
 
@@ -698,7 +824,13 @@ def main():
                 for _fs_try in range(6):
                     try:
                         print(f"[+] downloading: {out_path.name}")
-                        download_with_resume(session, audio_url, out_path, referer=base_url)
+                        download_with_resume(
+                            session,
+                            audio_url,
+                            out_path,
+                            referer=base_url,
+                            progress_label=out_path.name,
+                        )
                         visited.add(episode_key)
                         append_visited(visited_path, episode_key, date, producer, title)
                         downloaded_ok = True
@@ -748,10 +880,11 @@ def main():
 
         context.close()
 
+    run_end = datetime.now().astimezone()
+    elapsed_s = (run_end - run_start).total_seconds()
+    print(f"[i] RUN END:   {run_end.strftime('%Y-%m-%d %H:%M:%S')} | elapsed {fmt_duration(elapsed_s)}")
     print("[i] Done.")
 
 
 if __name__ == "__main__":
     main()
-
-#TODO írja az időt majd hogy mikor kezdte el a letöltést meg hogy meddig csinálta a letöltést, esetleg egy gráfot ami mutatja hogy loadol lefelé
