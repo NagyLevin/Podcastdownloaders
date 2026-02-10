@@ -1,0 +1,109 @@
+= Podcastok letöltése
+Ezek a *.py fájlok arra szolgálnak, hogy podcast epizódokat töltsenek le különböző internetes oldalakról. Mivel nincs egyetlen, egységes „nagy podcast tárház”, és a különböző oldalakon eltérő a felépítés (lista, lejátszó, linkek, pagináció, cookie banner stb.), ezért minden forráshoz külön letöltő szkriptet készítettem.
+
+== podkaszt_hu.py
+
+A `podkaszt_hu.py` a https://podkaszt.hu/ oldalon listázott epizódokat járja be oldalról oldalra, kinyeri az epizódokhoz tartozó audio URL-t (a beágyazott lejátszóból és/vagy hálózati válaszokból), majd letölti a fájlokat a megadott könyvtárba. A program arra is figyel, hogy ne töltse le újra ugyanazokat az epizódokat, és a sikertelen letöltéseket naplózza.
+
+=== Fő funkciók
+
+* Paginált lista bejárása:
+** `--start-page` és `--end-page` között oldalanként feldolgozza a táblázatot.
+** A start oldalra léptetésnél kiírja: `skipped to page N`.
+
+* Cookie banner kezelése:
+** Ha megjelenik, megpróbálja elfogadni (gomb felirat alapján).
+
+* Epizódazonosítás és duplikációk elkerülése:
+** Egy epizód kulcsa: `sha1(title|producer|date)`.
+** A már feldolgozott epizódokat a `--visited` fájl tartja nyilván.
+
+* Biztonságos fájlnév-képzés:
+** A fájlnév tartalmazza: `producer - title - date [key10].ext`.
+** Karaktertisztítás (`slugify`) és fájlrendszer limit figyelés.
+** Ha a fájlnév túl hosszú lenne, a program `___` jelöléssel vágja.
+** Ha futás közben mégis `File name too long` történik, akkor fallback-ként a fájlnév hosszát megfelezi, és a végén megmarad a `___` jelzés.
+** A konzolra kiírja: `fallback: fajlnev tul hosszu, rovidites`.
+
+* Letöltés támogatása:
+** A letöltés `requests`-szel történik.
+** Resume támogatás: `.part` fájl + HTTP `Range` header (ha van részleges letöltés).
+** A letöltésekhez a Playwright session cookie-k átkerülnek `requests`-be (ha szükséges).
+
+* Hibák naplózása:
+** A sikertelen epizódok a `timeouts.txt` fájlba kerülnek.
+** Formátum (TAB szeparált):
+   filename<TAB>date<TAB>producer<TAB>title<TAB>episode_key<TAB>reason
+** Sikertelen esetben a konzolra is kiírja a hiba okát, ugyanazzal a szöveggel, mint ami a `timeouts.txt`-be kerül.
+
+* Oldalösszegzés:
+** Minden oldal végén kiírja: `letoltve X/Y`
+** (X = sikeres letöltés vagy “already exists”, Y = az adott oldalon a nem-visited epizódok száma)
+
+=== Futtatás
+
+Alap példa (1-től 10-ig):
+
+----
+python3 podkaszt_hu.py --start-page 1 --end-page 10
+----
+
+Nagyobb futás (1-től 400-ig):
+
+----
+python3 podkaszt_hu.py --start-page 1 --end-page 400
+----
+
+Ha debugolni szeretnél, hogy lásd a böngészőt:
+
+----
+python3 podkaszt_hu.py --start-page 1 --end-page 5 --headful --slowmo 150
+----
+
+=== Paraméterek
+
+* `--base-url`
+** Alap URL (default: `https://podkaszt.hu/adasok/uj/`)
+
+* `--start-page`
+** Kezdő oldal (default: `1`)
+
+* `--end-page`
+** Végső oldal (default: `2`)
+
+* `--out`
+** Letöltési könyvtár (default: `podcasts`)
+
+* `--visited`
+** A már feldolgozott epizódok nyilvántartása (default: `podkaszt_visited.txt`)
+
+* `--profile`
+** Playwright persistent profil mappa (default: `.pw-profile`)
+
+* `--headful`
+** Megjeleníti a böngészőt (debug)
+
+* `--slowmo`
+** Lassítás (ms), debug célra
+
+* `--audio-wait`
+** Maximum várakozás az audio URL megjelenésére (default: `12.0`)
+
+* `--retries`
+** Hányszor próbálja megszerezni az audio URL-t egy epizódnál (default: `3`)
+
+=== Kimenetek / fájlok
+
+* Letöltött fájlok:
+** `--out` könyvtárban (pl. `podcasts/`)
+
+* Epizód státusz nyilvántartás:
+** `--visited` fájl (TAB szeparált sorok)
+
+* Sikertelen epizódok listája:
+** `timeouts.txt` (TAB szeparált sorok)
+
+=== Megjegyzések
+
+* A `rows=N` a táblázat sorainak száma az oldalon, a `letoltve X/Y` pedig a nem-visited epizódokra számol (ezért eltérhet a `rows` értékétől).
+* Nagy oldalszámoknál előfordulhat, hogy a pagináció UI kattintás nem mindig sikerül; a kód ezért URL-es fallback-ket is próbál.

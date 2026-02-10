@@ -483,15 +483,15 @@ def halve_filename_fallback(out_dir: Path, filename: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default=BASE_URL_DEFAULT)  # alap url atallitas, hatha megvaltozik a jövöben az url
-    ap.add_argument("--start-page", type=int, default=1)  # kezdő oldal, hogy ne kelljen mindig 1-től induljon
-    ap.add_argument("--end-page", type=int, default=2)  # max letoltott oldalak szama
-    ap.add_argument("--out", default="podcasts")  # letöltési mappa a podcastoknak
-    ap.add_argument("--visited", default="podkaszt_visited.txt")  # visited file a podcastoknak
+    ap.add_argument("--base-url", default=BASE_URL_DEFAULT,help="base url of the podcast website")  # alap url atallitas, hatha megvaltozik a jövöben az url
+    ap.add_argument("--start-page", type=int, default=1, help="start page of the podcast website")  # kezdő oldal, hogy ne kelljen mindig 1-től induljon
+    ap.add_argument("--end-page", type=int, default=2, help="end page of the podcast website")  # max letoltott oldalak szama
+    ap.add_argument("--out", default="podcasts", help="output directory for the podcast files")  # letöltési mappa a podcastoknak
+    ap.add_argument("--visited", default="podkaszt_visited.txt", help="visited file for the podcast files")  # visited file a podcastoknak
     ap.add_argument("--profile", default=".pw-profile", help="Persistent browser profile folder (stores cookie consent)")
-    ap.add_argument("--headful", action="store_true")
+    ap.add_argument("--headful", action="store_true", help="show the browser window for debugging")
     ap.add_argument("--slowmo", type=int, default=0, help="ms slow motion for debugging (e.g. 150)")
-    ap.add_argument("--audio-wait", type=float, default=12.0)
+    ap.add_argument("--audio-wait", type=float, default=12.0, help="wait time for the audio url")
     ap.add_argument("--retries", type=int, default=3, help="How many times to attempt getting an audio URL per episode")
     args = ap.parse_args()
 
@@ -753,3 +753,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#TODO írja az időt majd hogy mikor kezdte el a letöltést meg hogy meddig csinálta a letöltést, esetleg egy gráfot ami mutatja hogy loadol lefelé
