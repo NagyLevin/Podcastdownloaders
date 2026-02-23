@@ -1,4 +1,11 @@
 {
+  "https://atalon.hu/egyensuly-program-e01-e10": {
+    "title": "Egyensúly Program - 10. Kalória számlálás dilemmái",
+    "date": "2022-02-04",
+    "source": "egyensuly-program",
+    "folder": "egyensuly-program",
+    "filename": "2022-02-04__egyensuly-program__egyensuly-program-e01-e10__Egyensúly Program - 10. Kalória számlálás dilemmái.mp3"
+  },
   "https://atalon.hu/egyensuly-program-s01-e01": {
     "title": "Egyensúly Program - 1. Bemutatkozás",
     "date": "2021-12-10",
@@ -182,11 +189,11 @@
     "filename": "2022-07-01__egyensuly-program__egyensuly-program-s01-e31__Egyensúly Program - 31. A túlsúly leadása.mp3"
   },
   "https://atalon.hu/egyensulyporgram-s01-e32": {
-    "title": "Egyensúly Program - 32. Lezárás",
+    "title": "EPIZÓDOK",
     "date": "2022-07-08",
     "source": "egyensuly-program",
     "folder": "egyensuly-program",
-    "filename": "2022-07-08__egyensuly-program__egyensulyporgram-s01-e32__Egyensúly Program - 32. Lezárás.mp3"
+    "filename": "2022-07-08__egyensuly-program__egyensulyporgram-s01-e32__EPIZÓDOK.mp3"
   },
   "https://atalon.hu/egyensulyprogram-s01-e16": {
     "title": "Egyensúly Program - 16. Pihentető alvás és a relaxáció hatása",
@@ -294,10 +301,24 @@
     "filename": "2022-01-26__garami-gabor-podcast__garami-s01-e13__Garami Podcast - 13. Kohári Éva.mp3"
   },
   "https://atalon.hu/garami-s01-e14": {
-    "title": "Garami Podcast - 14. Baracsy Gabi",
+    "title": "EPIZÓDOK",
     "date": "2022-02-02",
     "source": "garami-gabor-podcast",
     "folder": "garami-gabor-podcast",
-    "filename": "2022-02-02__garami-gabor-podcast__garami-s01-e14__Garami Podcast - 14. Baracsy Gabi.mp3"
+    "filename": "2022-02-02__garami-gabor-podcast__garami-s01-e14__EPIZÓDOK.mp3"
+  },
+  "https://atalon.hu/garami-s01e03": {
+    "title": "Garami Podcast - 3. Kiss Korinna",
+    "date": "2021-11-17",
+    "source": "garami-gabor-podcast",
+    "folder": "garami-gabor-podcast",
+    "filename": "2021-11-17__garami-gabor-podcast__garami-s01e03__Garami Podcast - 3. Kiss Korinna.mp3"
+  },
+  "https://atalon.hu/garami-s01e04": {
+    "title": "Garami Podcast - 4. Pataki Márk",
+    "date": "2021-11-22",
+    "source": "garami-gabor-podcast",
+    "folder": "garami-gabor-podcast",
+    "filename": "2021-11-22__garami-gabor-podcast__garami-s01e04__Garami Podcast - 4. Pataki Márk.mp3"
   }
 }
