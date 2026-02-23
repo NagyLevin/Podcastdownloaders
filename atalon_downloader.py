@@ -18,20 +18,12 @@ DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 }
 
-# Epizód URL minta: ...-s01-e14
 EPISODE_PATH_RE = re.compile(r"-s\d+-e\d+", re.IGNORECASE)
-
-# MP3/M4A/WAV/AAC direkt link keresés (__NEXT_DATA__ / HTML-ben)
-AUDIO_URL_RE = re.compile(
-    r'https://[^\s"<>]*?\.(?:mp3|m4a|wav|aac)[^\s"<>]*',
-    re.IGNORECASE
-)
-
-# Dátum: 2022. 02. 02. (záró pont opcionális)
+AUDIO_URL_RE = re.compile(r'https://[^\s"<>]*?\.(?:mp3|m4a|wav|aac)[^\s"<>]*', re.IGNORECASE)
 HU_DATE_RE = re.compile(r"\b(\d{4})\.\s*(\d{2})\.\s*(\d{2})\.?\b")
 
 
-# -------------------- basic utils --------------------
+# -------------------- utils --------------------
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -115,20 +107,16 @@ def parse_input_urls(lines: list[str]) -> list[str]:
 def mark_done_in_input_file(input_path: str, done_urls: set[str]) -> None:
     lines = read_input_lines(input_path)
     out_lines = []
-
     for ln in lines:
         raw = ln.rstrip("\n")
         stripped = raw.strip()
-
         if not stripped or stripped.startswith("#"):
             out_lines.append(ln)
             continue
-
         if stripped in done_urls:
             out_lines.append("# " + stripped + "\n")
         else:
             out_lines.append(ln if ln.endswith("\n") else ln + "\n")
-
     with open(input_path, "w", encoding="utf-8") as f:
         f.writelines(out_lines)
 
@@ -179,11 +167,7 @@ def extension_from_audio_url(audio_url: str) -> str:
 
 
 def build_output_filename(date_norm: str, source_slug: str, episode_slug: str, title: str, ext: str) -> str:
-    source_slug = sanitize_filename(source_slug)
-    episode_slug = sanitize_filename(episode_slug)
-    title = sanitize_filename(title)
-
-    base = f"{date_norm}__{source_slug}__{episode_slug}__{title}"
+    base = f"{sanitize_filename(date_norm)}__{sanitize_filename(source_slug)}__{sanitize_filename(episode_slug)}__{sanitize_filename(title)}"
     base = truncate(base, 180)
     return base + ext
 
@@ -192,10 +176,8 @@ def download_audio(session: requests.Session, audio_url: str, out_path: str, ref
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         print(f"  - Már létezik, kihagyom: {out_path}")
         return
-
     headers = dict(DEFAULT_HEADERS)
     headers["Referer"] = referer
-
     with session.get(audio_url, stream=True, headers=headers, timeout=180) as r:
         r.raise_for_status()
         with open(out_path, "wb") as f:
@@ -252,16 +234,29 @@ def download_episode_requests(
     return True
 
 
-# -------------------- playwright: consent + load more + stable collect --------------------
+# -------------------- playwright: NEW approach --------------------
+
+def get_main_area(page):
+    # Ha van <main>, azt használjuk; különben a body-t.
+    try:
+        m = page.locator("main").first
+        if m.count() > 0:
+            return m
+    except Exception:
+        pass
+    return page.locator("body").first
+
+
+def is_visible_exact_text(scope, text_exact: str) -> bool:
+    # Csak látható elemeket figyelünk, és EXAKT feliratot.
+    try:
+        loc = scope.locator(f"xpath=.//*[normalize-space()='{text_exact}']").first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
 
 def handle_consent(page, timeout_ms: int = 15000) -> bool:
-    """
-    Robusztus consent popup kattintás:
-    - vár és újrapróbálkozik
-    - main frame + iframes
-    - többféle selector
-    - force click
-    """
     end = time.time() + timeout_ms / 1000.0
 
     accept_selectors = [
@@ -271,269 +266,307 @@ def handle_consent(page, timeout_ms: int = 15000) -> bool:
         'button:has-text("Elfogadom")',
         '[role="button"]:has-text("Elfogadom")',
         'text=Elfogadom',
-        'button:has-text("ACCEPT")',
-        '[role="button"]:has-text("ACCEPT")',
-        'text=ACCEPT',
-        'button:has-text("Accept")',
-        '[role="button"]:has-text("Accept")',
-        'text=Accept',
+        'text=/^ACCEPT$/i',
+        'text=/^Accept$/i',
     ]
 
-    reject_selectors = [
-        'button:has-text("NEM FOGADOM EL")',
-        '[role="button"]:has-text("NEM FOGADOM EL")',
-        'text=NEM FOGADOM EL',
-        'button:has-text("Nem fogadom el")',
-        '[role="button"]:has-text("Nem fogadom el")',
-        'text=Nem fogadom el',
-        'button:has-text("REJECT")',
-        '[role="button"]:has-text("REJECT")',
-        'text=REJECT',
-        'button:has-text("Reject")',
-        '[role="button"]:has-text("Reject")',
-        'text=Reject',
-    ]
-
-    def try_click(ctx, selectors) -> bool:
-        for sel in selectors:
+    def try_click(ctx) -> bool:
+        for sel in accept_selectors:
             try:
                 loc = ctx.locator(sel).first
-                if loc.count() > 0:
-                    loc.click(timeout=800, force=True)
+                if loc.count() > 0 and loc.is_visible():
+                    loc.click(timeout=1200, force=True)
                     return True
             except Exception:
                 pass
         return False
 
     while time.time() < end:
-        if try_click(page, accept_selectors):
+        if try_click(page):
             page.wait_for_timeout(800)
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=5000)
-            except Exception:
-                pass
             return True
-
         for fr in page.frames:
             if fr == page.main_frame:
                 continue
-            if try_click(fr, accept_selectors):
-                page.wait_for_timeout(800)
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=5000)
-                except Exception:
-                    pass
-                return True
-
-        # fallback reject (legalább eltűnjön)
-        if try_click(page, reject_selectors):
-            page.wait_for_timeout(800)
-            return True
-
-        for fr in page.frames:
-            if fr == page.main_frame:
-                continue
-            if try_click(fr, reject_selectors):
+            if try_click(fr):
                 page.wait_for_timeout(800)
                 return True
-
         page.wait_for_timeout(500)
 
     return False
 
 
-def click_show_more_if_present(page, max_clicks: int = 50) -> int:
-    """
-    Addig kattint a 'MUTASS TÖBBET' gombra (ha van), amíg eltűnik / már nem kattintható.
-    Többféle selectorral próbálja.
-    """
-    selectors = [
-        'text=MUTASS TÖBBET',
-        'text=Mutass többet',
-        'button:has-text("MUTASS TÖBBET")',
-        '[role="button"]:has-text("MUTASS TÖBBET")',
-        'button:has-text("Mutass többet")',
-        '[role="button"]:has-text("Mutass többet")',
+def click_mutass_tobbet(scope) -> bool:
+    # Text regexes selector: ha bármi ilyen felirat van, kattint.
+    candidates = [
+        'text=/^MUTASS\\s+TÖBBET$/i',
+        'text=/^Mutass\\s+többet$/i',
     ]
-
-    clicks = 0
-    for _ in range(max_clicks):
-        clicked = False
-        for sel in selectors:
-            try:
-                loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
-                    loc.click(timeout=1200, force=True)
-                    page.wait_for_timeout(700)
-                    clicks += 1
-                    clicked = True
-                    break
-            except Exception:
-                pass
-
-        if not clicked:
-            break
-
-    return clicks
+    for sel in candidates:
+        try:
+            loc = scope.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.scroll_into_view_if_needed()
+                loc.click(timeout=1500, force=True)
+                return True
+        except Exception:
+            pass
+    return False
 
 
-def count_episode_links_on_page(page) -> int:
+def scroll_step(page) -> bool:
+    # Sokszor nem a window scrolloz, hanem egy belső konténer.
     try:
-        hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-        cnt = 0
-        for h in hrefs:
-            try:
-                if EPISODE_PATH_RE.search(urlparse(h).path or ""):
-                    cnt += 1
-            except Exception:
-                pass
-        return cnt
-    except Exception:
-        return 0
-
-
-def load_all_episodes_by_scrolling_and_more(page, max_steps: int = 40, pause_ms: int = 800) -> None:
-    """
-    Kombinált stratégia:
-    - consent kezelése
-    - scroll + 'Mutass többet' kattintás
-    - addig, amíg az epizód linkek száma stabilizálódik
-    """
-    stable = 0
-    last = -1
-
-    for _ in range(max_steps):
-        # próbáljuk levadászni a consentet (ha később jelenik meg)
-        handle_consent(page, timeout_ms=2500)
-
-        # kattintsunk rá a "Mutass többet"-re, ha van
-        click_show_more_if_present(page, max_clicks=3)
-
-        # scroll: window + belső scroller elemek
-        page.evaluate("""
+        moved = page.evaluate("""
         () => {
-          window.scrollTo(0, document.body.scrollHeight);
+          let moved = false;
+
+          const y0 = window.scrollY;
+          window.scrollBy(0, window.innerHeight * 0.9);
+          if (window.scrollY !== y0) moved = true;
+
           const scrollers = Array.from(document.querySelectorAll('*')).filter(el => {
             const s = getComputedStyle(el);
             const oy = s.overflowY;
-            return (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight;
+            return (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 50;
           });
-          for (const el of scrollers) el.scrollTop = el.scrollHeight;
+
+          scrollers.sort((a,b) => (b.scrollHeight-b.clientHeight) - (a.scrollHeight-a.clientHeight));
+
+          if (scrollers.length > 0) {
+            const el = scrollers[0];
+            const before = el.scrollTop;
+            el.scrollTop = Math.min(el.scrollTop + el.clientHeight * 0.9, el.scrollHeight);
+            if (el.scrollTop !== before) moved = true;
+          }
+
+          return moved;
         }
         """)
-        page.wait_for_timeout(pause_ms)
-
-        cnt = count_episode_links_on_page(page)
-
-        if cnt == last:
-            stable += 1
-        else:
-            stable = 0
-            last = cnt
-
-        # ha 3 kör óta nem nő, elég
-        if stable >= 3:
-            break
+        return bool(moved)
+    except Exception:
+        return False
 
 
-def collect_episode_links_with_meta(show_url: str, headful: bool) -> list[dict]:
-    items = []
+def scroll_to_top_everywhere(page) -> None:
+    try:
+        page.evaluate("""
+        () => {
+          window.scrollTo(0, 0);
+          const scrollers = Array.from(document.querySelectorAll('*')).filter(el => {
+            const s = getComputedStyle(el);
+            const oy = s.overflowY;
+            return (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 50;
+          });
+          for (const el of scrollers) el.scrollTop = 0;
+        }
+        """)
+    except Exception:
+        pass
+    page.wait_for_timeout(800)
+
+
+def extract_visible_episode_meta(page) -> list[dict]:
+    """
+    LÁTHATÓ/DOM-ban lévő epizódok meta kinyerése (url/title/date).
+    Ezt sokszor hívjuk scroll közben -> nem marad ki a virtualizált lista miatt.
+    """
+    js = r"""
+    () => {
+      const reEp = /-s\d+-e\d+/i;
+      const reDate = /(\d{4})\.\s*(\d{2})\.\s*(\d{2})\.?/;
+
+      const out = [];
+      const seen = new Set();
+
+      const links = Array.from(document.querySelectorAll('a[href]'))
+        .filter(a => reEp.test(a.href || ''));
+
+      for (const a of links) {
+        const href = a.href || '';
+        if (!href || seen.has(href)) continue;
+        seen.add(href);
+
+        // Keressük a legkisebb "kártya" konténert: dátum benne van + kevés epizód link
+        let node = a;
+        let best = null;
+
+        for (let i = 0; i < 25 && node; i++) {
+          const txt = (node.innerText || '');
+          const hasDate = reDate.test(txt);
+
+          if (hasDate) {
+            const linksHere = Array.from(node.querySelectorAll('a[href]'))
+              .filter(x => reEp.test(x.href || ''))
+              .length;
+
+            // ha kicsi a konténer (1-2 epizód link), nagy eséllyel ez az epizód sora
+            if (linksHere <= 2) { best = node; break; }
+
+            // fallback: első dátumos ős
+            if (!best) best = node;
+          }
+
+          node = node.parentElement;
+        }
+
+        let title = (a.textContent || '').trim();
+        if (!title && best) {
+          const h = best.querySelector('h1,h2,h3,h4');
+          if (h) title = (h.textContent || '').trim();
+        }
+
+        let date = '';
+        if (best) {
+          const m = (best.innerText || '').match(reDate);
+          if (m) date = `${m[1]}.${m[2]}.${m[3]}.`;
+        }
+
+        out.push({href, title, date});
+      }
+      return out;
+    }
+    """
+    try:
+        return page.evaluate(js)
+    except Exception:
+        return []
+
+
+def detect_creator_vs_podcastlist(page) -> str:
+    """
+    Csak a fő tartalomrészben vizsgálunk EXAKT feliratot, és csak láthatót.
+    - creator: PODCASTOK látható, EPIZÓDOK nem látható
+    - podcast_list: EPIZÓDOK látható
+    - unknown: más
+    """
+    main = get_main_area(page)
+    has_epizodok = is_visible_exact_text(main, "EPIZÓDOK")
+    has_podcastok = is_visible_exact_text(main, "PODCASTOK")
+
+    if has_epizodok:
+        return "podcast_list"
+    if has_podcastok and not has_epizodok:
+        return "creator"
+    return "unknown"
+
+
+def collect_episodes_from_show_page(show_url: str, headful: bool) -> tuple[str, list[dict]]:
+    """
+    ÚJ stratégia:
+    - consent kezelése
+    - creator/podcast_list detektálás a MAIN tartalomból
+    - scroll + 'Mutass többet' közben folyamatos gyűjtés
+    - failsafe: 2. teljes passz (felülről újra)
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headful)
         context = browser.new_context()
         page = context.new_page()
-        page.goto(show_url, wait_until="domcontentloaded", timeout=60000)
 
+        page.goto(show_url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(1200)
-        # consent elsőre + később is lesz még próbálkozás a loopban
         handle_consent(page, timeout_ms=15000)
 
-        # itt töltjük be az összes epizódot: scroll + mutass többet + stabilizálódás
-        load_all_episodes_by_scrolling_and_more(page, max_steps=40, pause_ms=800)
+        ptype = detect_creator_vs_podcastlist(page)
+        if ptype == "creator":
+            # ez az a főoldal, amit kérsz, hogy skippeljük
+            page.close()
+            browser.close()
+            return "creator", []
 
+        main = get_main_area(page)
         base_netloc = urlparse(show_url).netloc
 
-        # DOM-ból szedjük ki az epizódokat + dátumot "kártya konténerből"
-        js = r"""
-        () => {
-          const reEp = /-s\d+-e\d+/i;
-          const reDate = /(\d{4})\.\s*(\d{2})\.\s*(\d{2})\.?/;
+        def run_pass(max_steps: int = 160) -> dict[str, dict]:
+            collected: dict[str, dict] = {}
+            stable_no_new = 0
 
-          const out = [];
-          const seen = new Set();
+            for _ in range(max_steps):
+                handle_consent(page, timeout_ms=2000)
 
-          const allLinks = Array.from(document.querySelectorAll('a[href]'));
-          const epLinks = allLinks.filter(a => reEp.test(a.href || ''));
+                # "Mutass többet" próbálkozás többször, mert néha későn jelenik meg
+                for __ in range(3):
+                    if not click_mutass_tobbet(main):
+                        break
+                    page.wait_for_timeout(700)
 
-          for (const a of epLinks) {
-            const href = a.href || '';
-            if (!href) continue;
-            if (seen.has(href)) continue;
-            seen.add(href);
+                batch = extract_visible_episode_meta(page)
+                new_cnt = 0
 
-            // legkisebb konténer: dátumot tartalmaz és csak 1 ep link van benne
-            let node = a;
-            let best = null;
+                for it in batch:
+                    href = (it.get("href") or "").strip()
+                    if not href:
+                        continue
+                    pu = urlparse(href)
+                    if pu.scheme not in ("http", "https"):
+                        continue
+                    if pu.netloc != base_netloc:
+                        continue
+                    if not EPISODE_PATH_RE.search(pu.path or ""):
+                        continue
 
-            while (node && node !== document.body) {
-              const txt = (node.innerText || '');
-              const hasDate = reDate.test(txt);
+                    if href not in collected:
+                        collected[href] = {
+                            "url": href,
+                            "title": (it.get("title") or "").strip() or None,
+                            "date": (it.get("date") or "").strip() or None
+                        }
+                        new_cnt += 1
+                    else:
+                        if not collected[href].get("title") and (it.get("title") or "").strip():
+                            collected[href]["title"] = (it.get("title") or "").strip()
+                        if not collected[href].get("date") and (it.get("date") or "").strip():
+                            collected[href]["date"] = (it.get("date") or "").strip()
 
-              if (hasDate) {
-                const linksHere = Array.from(node.querySelectorAll('a[href]'))
-                  .filter(x => reEp.test(x.href || ''))
-                  .length;
+                if new_cnt == 0:
+                    stable_no_new += 1
+                else:
+                    stable_no_new = 0
 
-                if (linksHere === 1) { best = node; break; }
-                if (!best) best = node;
-              }
-              node = node.parentElement;
-            }
+                moved = scroll_step(page)
+                page.wait_for_timeout(650)
 
-            let title = (a.textContent || '').trim();
-            if (!title && best) {
-              const h = best.querySelector('h1,h2,h3,h4');
-              if (h) title = (h.textContent || '').trim();
-            }
+                # ha sokáig nincs új ÉS már scroll se mozdul, akkor vége
+                if stable_no_new >= 10 and not moved:
+                    break
 
-            let date = '';
-            if (best) {
-              const m = (best.innerText || '').match(reDate);
-              if (m) date = `${m[1]}.${m[2]}.${m[3]}.`;
-            }
+            return collected
 
-            out.push({href, title, date});
-          }
+        # PASS 1
+        c1 = run_pass()
+        print(f"  - PASS 1: {len(c1)} epizód")
 
-          return out;
-        }
-        """
-        raw = page.evaluate(js)
+        # FAILSAFE PASS 2 (felülről újra)
+        scroll_to_top_everywhere(page)
+        handle_consent(page, timeout_ms=3000)
+        c2 = run_pass()
+        print(f"  - PASS 2: {len(c2)} epizód")
 
-        seen = set()
-        for it in raw:
-            href = (it.get("href") or "").strip()
-            if not href:
-                continue
-            pu = urlparse(href)
-            if pu.scheme not in ("http", "https"):
-                continue
-            if pu.netloc != base_netloc:
-                continue
-            if href in seen:
-                continue
-            seen.add(href)
+        merged = dict(c1)
+        for k, v in c2.items():
+            if k not in merged:
+                merged[k] = v
+            else:
+                if not merged[k].get("title") and v.get("title"):
+                    merged[k]["title"] = v["title"]
+                if not merged[k].get("date") and v.get("date"):
+                    merged[k]["date"] = v["date"]
 
-            items.append({
-                "url": href,
-                "title": (it.get("title") or "").strip() or None,
-                "date": (it.get("date") or "").strip() or None
-            })
+        episodes = list(merged.values())
+        episodes.sort(key=lambda x: x["url"])
+
+        # Ha még mindig 0 epizód, akkor gyakorlatban creator/invalid -> jelöljük unknown-nak, és a hívó oldalon kezeljük
+        if len(episodes) == 0 and ptype == "unknown":
+            # utolsó check: van-e egyáltalán epizód link a DOM-ban
+            dom_hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+            has_any_episode = any(EPISODE_PATH_RE.search(urlparse(h).path or "") for h in dom_hrefs if isinstance(h, str))
+            if not has_any_episode:
+                ptype = "creator"
 
         page.close()
         browser.close()
-
-    return items
+        return ptype, episodes
 
 
 # -------------------- main --------------------
@@ -549,8 +582,7 @@ def main():
     ensure_dir(args.out)
     visited = load_visited(args.visited)
 
-    lines = read_input_lines(args.input)
-    seeds = parse_input_urls(lines)
+    seeds = parse_input_urls(read_input_lines(args.input))
     if not seeds:
         print("Nincs feldolgozható URL az inputban (lehet, hogy mind #).")
         return
@@ -564,7 +596,6 @@ def main():
             print(f"\n=== Seed: {seed} ===")
             ok_all = True
 
-            # seed -> almappa: out/<seed-slug>/
             source_slug = slug_from_url(seed)
             out_dir_seed = os.path.join(args.out, source_slug)
             ensure_dir(out_dir_seed)
@@ -582,24 +613,28 @@ def main():
                     )
                     ok_all = ok_all and ok
                 else:
-                    episodes = collect_episode_links_with_meta(seed, headful=args.headful)
-                    print(f"  - Talált epizódok: {len(episodes)}")
+                    ptype, episodes = collect_episodes_from_show_page(seed, headful=args.headful)
 
-                    if not episodes:
+                    if ptype == "creator":
+                        print("  - Creator/Podcastok főoldal -> SKIP (nem jelölöm késznek)")
                         ok_all = False
                     else:
-                        for ep in episodes:
-                            ok = download_episode_requests(
-                                episode_url=ep["url"],
-                                out_dir=out_dir_seed,
-                                session=session,
-                                visited=visited,
-                                source_slug=source_slug,
-                                known_title=ep.get("title"),
-                                known_date=ep.get("date")
-                            )
-                            if not ok:
-                                ok_all = False
+                        print(f"  - Talált epizódok összesen: {len(episodes)}")
+                        if not episodes:
+                            ok_all = False
+                        else:
+                            for ep in episodes:
+                                ok = download_episode_requests(
+                                    episode_url=ep["url"],
+                                    out_dir=out_dir_seed,
+                                    session=session,
+                                    visited=visited,
+                                    source_slug=source_slug,
+                                    known_title=ep.get("title"),
+                                    known_date=ep.get("date")
+                                )
+                                if not ok:
+                                    ok_all = False
 
             except Exception as e:
                 print(f"  - Seed hiba: {e}")
@@ -611,7 +646,7 @@ def main():
                 done_seeds.add(seed)
                 print("  - Seed kész, megjelölöm # -tel az inputban.")
             else:
-                print("  - Seed NEM teljesen sikeres, nem jelölöm késznek.")
+                print("  - Seed NEM teljesen sikeres / SKIP, nem jelölöm késznek.")
 
     if done_seeds:
         mark_done_in_input_file(args.input, done_seeds)
