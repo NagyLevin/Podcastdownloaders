@@ -2,7 +2,7 @@
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import re
 
-QUERY = "magyar"
+QUERY = "magyar podcast"
 START_URL = f"https://soundcloud.com/search?q={QUERY}"
 FALLBACK_SETS_URL = f"https://soundcloud.com/search/sets?q={QUERY}"
 OUTFILE = f"soundcloud_playlists_{QUERY}.txt"
