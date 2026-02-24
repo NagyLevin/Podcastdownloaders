@@ -19,14 +19,23 @@ def truncate_text(text: str, max_length: int) -> str:
         return text[:max_length].strip() + "..."
     return text
 
-def download_file_with_requests(url: str, filepath: str):
-    """Közvetlenül letölti a fájlt az URL-ről, böngészőnek álcázva magát."""
+def download_file_with_requests(url: str, filepath: str, page):
+    """
+    Közvetlenül letölti a fájlt az URL-ről, átemelve a Playwright munkamenetét,
+    hogy a védett (pl. Megaphone) linkeknél is meglegyen a jogosultság.
+    """
+    user_agent = page.evaluate("navigator.userAgent")
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://podcast.hu/",
+        "User-Agent": user_agent,
+        "Referer": page.url,
         "Accept": "audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,application/ogg;q=0.7,video/*;q=0.6,*/*;q=0.5"
     }
-    response = requests.get(url, stream=True, headers=headers)
+    
+    playwright_cookies = page.context.cookies()
+    session_cookies = {c['name']: c['value'] for c in playwright_cookies}
+
+    response = requests.get(url, stream=True, headers=headers, cookies=session_cookies, timeout=30)
     response.raise_for_status()
     with open(filepath, 'wb') as f:
         for chunk in response.iter_content(chunk_size=8192):
@@ -37,6 +46,7 @@ def main():
     parser.add_argument('--startpage', type=int, default=1, help='Kezdő oldal száma')
     parser.add_argument('--endpage', type=int, default=100, help='Utolsó oldal száma')
     parser.add_argument('--out', type=str, default='./podcasts', help='Kimeneti mappa a letöltéseknek')
+    parser.add_argument('--headless', action='store_true', help='Futtatás grafikus felület nélkül (szerverekhez)')
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -54,7 +64,7 @@ def main():
     current_year = datetime.now().year
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=args.headless)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
@@ -65,14 +75,14 @@ def main():
             try:
                 page.goto(url)
             except Exception as e:
-                print(f"❌ Hiba az oldal betöltésekor: {e}")
+                print(f":( Hiba az oldal betöltésekor: {e}")
                 continue
             
             # Sütik elfogadása
             try:
                 page.wait_for_selector("text=Mindegyik elfogadása", timeout=3000)
                 page.locator("text=Mindegyik elfogadása").click()
-                print("✅ Süti banner leokézva.")
+                print(" Süti banner leokézva.")
             except PwTimeoutError:
                 pass
             
@@ -82,21 +92,26 @@ def main():
                 print(f"Nincsenek találatok a(z) {page_num}. oldalon, vagy a végére értünk.")
                 break
 
-            # URL-ek összegyűjtése
+            # --- JAVÍTVA: URL-ek okosabb összegyűjtése ---
             episode_urls = []
             links = page.locator("a").all()
             for link in links:
                 href = link.get_attribute("href")
-                if href and "/podcast/" in href:
-                    parts = [part for part in href.split("/") if part]
-                    try:
-                        podcast_idx = parts.index("podcast")
-                        if len(parts) >= podcast_idx + 3: 
-                            full_url = urljoin(page.url, href)
-                            if full_url not in episode_urls:
-                                episode_urls.append(full_url)
-                    except ValueError:
-                        continue
+                if href:
+                    # SZIGORÍTÁS: Csak a belső epizód linkek érdekelnek minket!
+                    if href.startswith("/podcast/") or href.startswith("https://podcast.hu/podcast/"):
+                        # Eltávolítjuk az esetleges query stringeket (?v=...) a pontosság miatt
+                        clean_href = href.split("?")[0]
+                        parts = [part for part in clean_href.split("/") if part]
+                        try:
+                            podcast_idx = parts.index("podcast")
+                            # Ellenőrizzük, hogy ez tényleg epizód (podcast / csatorna / epizod_id)
+                            if len(parts) >= podcast_idx + 3: 
+                                full_url = urljoin(page.url, href)
+                                if full_url not in episode_urls:
+                                    episode_urls.append(full_url)
+                        except ValueError:
+                            continue
             
             if not episode_urls:
                 print("Nem találtam letölthető epizódokat ezen az oldalon.")
@@ -106,22 +121,20 @@ def main():
 
             for i, ep_url in enumerate(episode_urls):
                 try:
-                    # --- JAVÍTVA: Biztonságosabb betöltés, felkészülve a külsős letöltő linkekre ---
                     try:
                         page.goto(ep_url, timeout=15000)
                         page.wait_for_load_state("domcontentloaded", timeout=5000)
                     except Exception as e:
                         if ".m4a" in ep_url.lower() or ".mp3" in ep_url.lower() or "anchor.fm" in ep_url:
-                            pass # Ha közvetlen link, a timeout ellenére is megpróbáljuk letölteni
+                            pass
                         else:
-                            print(f"❌ Oldal betöltési hiba: {ep_url} ({e})")
+                            print(f":( Oldal betöltési hiba: {ep_url} ({e})")
                             continue
 
-                    # Várunk a címre VAGY a böngésző beépített audio/video lejátszójára
                     try:
                         page.wait_for_selector("h1.p-episode__title--desktop, h1:visible, video, audio", timeout=5000)
                     except PwTimeoutError:
-                        pass # Nem dobjuk el azonnal, hátha az URL maga a forrás
+                        pass
                         
                     title_loc = page.locator("h1.p-episode__title--desktop")
                     if title_loc.count() == 0:
@@ -130,9 +143,7 @@ def main():
                     date_str = ""
                     author = "Ismeretlen_Eloado"
 
-                    # --- JAVÍTVA: Kétféle feldolgozási út (Normál oldal vs. Csupasz lejátszó) ---
                     if title_loc.count() > 0:
-                        # 1. Normál podcast.hu dizájn
                         title = title_loc.first.inner_text().strip()
                         title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:8]
                         
@@ -159,23 +170,19 @@ def main():
                             if found_author: 
                                 author = found_author
                     else:
-                        # 2. Csupasz lejátszó / Külsős link (Nincs h1)
                         decoded_url = urllib.parse.unquote(ep_url)
                         title_fallback = decoded_url.split("/")[-1].split("?")[0]
                         if not title_fallback or len(title_fallback) < 3:
                             title_fallback = f"Episode_{i}"
                             
                         title = "Kulsos_Epizod_" + title_fallback
-                        # Itt az URL-ből generálunk hasht, hogy egyedi legyen
                         title_hash = hashlib.md5(ep_url.encode('utf-8')).hexdigest()[:8]
                         date_str = ""
                     
-                    # Hash ellenőrzés (minden útvonalra érvényes)
                     if title_hash in visited:
                         print(f"Már letöltve, ugrás: {title}")
                         continue 
 
-                    # Fájlnév formázása
                     safe_date = ""
                     if date_str:
                         if not re.search(r'\d{4}', date_str):
@@ -187,23 +194,19 @@ def main():
                     
                     print(f"Feldolgozás: {title} | Előadó: {author}")
 
-                    # --- JAVÍTVA: Audio forrás kinyerése okosabban ---
                     download_success = False
                     try:
                         audio_src = ""
-                        # Keresés <audio> tagben
                         if page.locator("audio").count() > 0:
                             audio_src = page.locator("audio").first.get_attribute("src")
                             if not audio_src and page.locator("audio source").count() > 0:
                                 audio_src = page.locator("audio source").first.get_attribute("src")
                         
-                        # Keresés <video> tagben (a Chromium gyakran ebbe teszi a nyers audio linkeket!)
                         if not audio_src and page.locator("video").count() > 0:
                             audio_src = page.locator("video").first.get_attribute("src")
                             if not audio_src and page.locator("video source").count() > 0:
                                 audio_src = page.locator("video source").first.get_attribute("src")
                         
-                        # Ha sehol nincs tag, de az URL eleve média
                         if not audio_src:
                             current_url = page.url.lower()
                             if ".m4a" in current_url or ".mp3" in current_url or "anchor.fm" in current_url:
@@ -215,7 +218,6 @@ def main():
                             if not audio_src.startswith("http"):
                                 audio_src = urljoin(page.url, audio_src)
                             
-                            # Kiterjesztés okos felismerése
                             ext = ".mp3"
                             if ".m4a" in audio_src.lower():
                                 ext = ".m4a"
@@ -224,26 +226,25 @@ def main():
                             filepath = os.path.join(args.out, filename)
 
                             print(f"Letöltés megkezdése a háttérben ({ext})...")
-                            download_file_with_requests(audio_src, filepath)
+                            download_file_with_requests(audio_src, filepath, page)
                             download_success = True
                         else:
-                            print(f"❌ Nincs felismerhető audio lejátszó vagy link ezen az oldalon.")
+                            print(f":( Nincs felismerhető audio lejátszó vagy link ezen az oldalon.")
 
                     except Exception as e:
-                        print(f"❌ Hiba a letöltés során: {e}")
+                        print(f":( Hiba a letöltés során: {e}")
 
-                    # Naplózás
                     if download_success:
-                        print(f"✅ Sikeres letöltés: {filename}")
+                        print(f":) Sikeres letöltés: {filename}")
                         with open(visited_file, 'a', encoding='utf-8') as f:
                             f.write(f"{title_hash}\t{title}\n")
                         visited.add(title_hash)
                         
                 except Exception as e:
-                    print(f"❌ Hiba történt az epizód feldolgozásakor: {e}")
+                    print(f":() Hiba történt az epizód feldolgozásakor: {e}")
 
         browser.close()
-        print("\n🎉 Folyamat befejezve!")
+        print("\n Folyamat befejezve!")
 
 if __name__ == "__main__":
     main()
