@@ -5,10 +5,14 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Optional, Dict
+from urllib.parse import urlparse, urlsplit, urlunsplit, unquote
 
 import requests
+import requests.exceptions as req_exc
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError
 
 BASE_URL_DEFAULT = "https://podkaszt.hu/adasok/uj/"  # podcastok 20 oldalanként 3500 oldal
@@ -17,6 +21,8 @@ TMP_SUFFIX = ".part"
 
 COOKIE_ACCEPT_REGEX = re.compile(r"(Beleegyezés|Elfogadom|Accept|Agree|Allow)", re.I)
 
+
+# ----------------- idő / formázók -----------------
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -52,6 +58,8 @@ def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
+# ----------------- fájlnév tisztítás -----------------
+
 def slugify(name: str, max_len: int = 4000) -> str:
     """
     Fájlnévben nem megengedett karakterek cseréje.
@@ -68,6 +76,8 @@ def slugify(name: str, max_len: int = 4000) -> str:
         name = name[:max_len].rstrip(" ._")
     return name or "untitled"
 
+
+# ----------------- visited / timeout log -----------------
 
 def load_visited(path: Path) -> set[str]:
     visited = set()
@@ -100,6 +110,20 @@ def append_timeout(path: Path, filename: str, date: str, producer: str, title: s
         f.write(line)
 
 
+def append_dead(path: Path, url: str, reason: str):
+    """
+    Opcionális: ide rakjuk a nagy eséllyel „végleges” hibákat (404, DNS, stb),
+    hogy később ne pörögj rájuk újra feleslegesen.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reason = (reason or "").replace("\n", " ").replace("\r", " ").strip()
+    line = f"{now_utc_iso()}\t{url}\t{reason}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+# ----------------- Playwright segéd -----------------
+
 def accept_cookies_if_present(page) -> bool:
     # main document
     try:
@@ -123,6 +147,35 @@ def accept_cookies_if_present(page) -> bool:
             continue
 
     return False
+
+
+def wait_for_overlays(page, timeout_ms: int = 4000):
+    """
+    A timeouts.txt-ben látszott "spinner intercepts pointer events" jellegű kattintási hiba.
+    Itt több tipikus overlay/spinner szelektort próbálunk eltüntetni.
+    (Nem baj, ha nincs ilyen elem.)
+    """
+    selectors = [
+        "#spinner",
+        ".spinner",
+        ".loading",
+        ".overlay",
+        ".modal-backdrop",
+        "[aria-busy='true']",
+        ".fa-spinner",
+        "app-spinner",
+    ]
+    t0 = time.monotonic()
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                # várjuk, hogy eltűnjön / ne blokkoljon
+                loc.first.wait_for(state="hidden", timeout=max(500, timeout_ms // 2))
+        except Exception:
+            pass
+        if (time.monotonic() - t0) * 1000 > timeout_ms:
+            break
 
 
 def find_table(page):
@@ -323,6 +376,10 @@ def try_goto_page_by_url(page, base_url: str, target_page: int) -> bool:
 
 
 def get_audio_url_from_player(page, wait_s: float = 12.0) -> Optional[str]:
+    """
+    Először megpróbáljuk a <audio>/<video> currentSrc/src értékét.
+    Ha blob: URL, azt elengedjük (az nem letölthető egyszerűen).
+    """
     try:
         page.wait_for_function(
             "() => { const m=document.querySelector('audio,video'); return m && (m.currentSrc || m.src) && (m.currentSrc || m.src).length>0; }",
@@ -341,10 +398,139 @@ def get_audio_url_from_player(page, wait_s: float = 12.0) -> Optional[str]:
         return None
 
 
+# ----------------- URL és host-specifikus fixek -----------------
+
 def guess_ext_from_url(url: str) -> str:
     path = urlparse(url).path
     ext = os.path.splitext(path)[1].lower()
     return ext if ext in AUDIO_EXTS else ".mp3"
+
+
+def sanitize_audio_url(url: str) -> str:
+    """
+    timeouts.txt-ben volt olyan, hogy host='http' (pl. https://http/feeds.soundcloud.com/...)
+    illetve 'https://http://...' jellegű elcsúszás.
+    Itt ezeket kigyomláljuk.
+    """
+    url = (url or "").strip()
+
+    # 1) https://http/...
+    if url.startswith("https://http/"):
+        url = "https://" + url[len("https://http/"):]
+    if url.startswith("http://http/"):
+        url = "http://" + url[len("http://http/"):]
+
+    # 2) https://http://...
+    if url.startswith("https://http://"):
+        url = "http://" + url[len("https://http://"):]
+    if url.startswith("http://https://"):
+        url = "https://" + url[len("http://https://"):]
+
+    # 3) ha nincs scheme
+    p = urlparse(url)
+    if not p.scheme:
+        url = "https://" + url.lstrip("/")
+
+    return url
+
+
+def rewrite_special_hosts(url: str) -> str:
+    """
+    - g7.p3k.hu -> g7.hu (gyakori routing 'no route to host' / connect timeout)
+    """
+    try:
+        parts = urlsplit(url)
+        netloc = parts.netloc.lower()
+
+        if netloc == "g7.p3k.hu":
+            new_parts = (parts.scheme, "g7.hu", parts.path, parts.query, parts.fragment)
+            return urlunsplit(new_parts)
+
+    except Exception:
+        pass
+    return url
+
+
+def decode_anchor_wrapped_url(url: str) -> str:
+    """
+    Anchor.fm-nél gyakori minta:
+      https://anchor.fm/.../podcast/play/.../http%3A%2F%2Fexample.com%2Ffile.mp3
+    Itt az utolsó %-enkódolt rész az igazi média URL. Dekódoljuk.
+    """
+    try:
+        parts = urlsplit(url)
+        if "anchor.fm" not in parts.netloc.lower():
+            return url
+        if "/podcast/play/" not in parts.path:
+            return url
+
+        # Keressünk egy "http%3A%2F%2F" vagy "https%3A%2F%2F" szegmenst
+        if "http%3a%2f%2f" not in url.lower() and "https%3a%2f%2f" not in url.lower():
+            return url
+
+        last_seg = parts.path.split("/")[-1]
+        dec = unquote(last_seg)
+        if dec.startswith("http://") or dec.startswith("https://"):
+            return dec
+
+    except Exception:
+        pass
+    return url
+
+
+def https_to_http_fallback(url: str) -> str:
+    """
+    podcasts.faklyaradio.hu esetén a timeouts.txt-ben nagyon sok "connection refused" volt https-en.
+    Itt adunk egy lehetőséget: https -> http próbálkozás.
+    """
+    try:
+        parts = urlsplit(url)
+        if parts.scheme == "https" and parts.netloc.lower() == "podcasts.faklyaradio.hu":
+            return urlunsplit(("http", parts.netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        pass
+    return url
+
+
+def normalize_media_url(url: str) -> str:
+    """
+    Egyetlen helyre összefogjuk:
+    - sanitize (host='http' jelleg)
+    - anchor dekódolás
+    - g7 host rewrite
+    """
+    url = sanitize_audio_url(url)
+    url = decode_anchor_wrapped_url(url)
+    url = rewrite_special_hosts(url)
+    return url
+
+
+# ----------------- requests session + cookie sync -----------------
+
+def build_http_session(http_retries: int, backoff: float) -> requests.Session:
+    """
+    requests.Session Retry-vel:
+    - főleg a connect / initial handshake problémákat fogja meg
+    - mid-stream megszakadásnál a saját (download_with_resume) retry a lényeg
+    """
+    s = requests.Session()
+
+    retry = Retry(
+        total=http_retries,
+        connect=http_retries,
+        read=http_retries,
+        status=http_retries,
+        backoff_factor=backoff,
+        status_forcelist=[429, 500, 502, 503, 504, 522],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
 
 
 def sync_cookies_to_requests(context, session: requests.Session):
@@ -353,6 +539,72 @@ def sync_cookies_to_requests(context, session: requests.Session):
         jar.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
     session.cookies = jar
 
+
+# ----------------- HEADERS / HOST RATE LIMIT -----------------
+
+def browserish_headers(referer: str) -> Dict[str, str]:
+    """
+    Általános „böngészős” header csomag.
+    406/403/WAF esetén gyakran segít, hogy ne nézzen ki botnak.
+    """
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/121.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "hu-HU,hu;q=0.9,en-US;q=0.7,en;q=0.6",
+        "Referer": referer,
+        "Connection": "keep-alive",
+    }
+
+
+def headers_for_url(url: str, referer: str) -> Dict[str, str]:
+    """
+    Host-specifikus header finomhangolás:
+    - archive.tilos.hu (406) -> különösen fontos a böngésző-szerű Accept/Accept-Language
+    """
+    h = browserish_headers(referer)
+    host = ""
+    try:
+        host = urlsplit(url).netloc.lower()
+    except Exception:
+        host = ""
+
+    # Tilosnál néha a *//* accept is kell, máskor jobb konkrétabb:
+    if host == "archive.tilos.hu":
+        h["Accept"] = "audio/*,*/*;q=0.8"
+    return h
+
+
+def host_key(url: str) -> str:
+    try:
+        return urlsplit(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def ensure_host_delay(url: str, host_last_ts: Dict[str, float], default_delay: float, g7_delay: float, tilos_delay: float):
+    """
+    Egyszerű rate-limit: hostonként tartunk utolsó request időpontot.
+    A g7 és tilos jobban érzékeny (522/406), ott nagyobb delay-t használunk.
+    """
+    h = host_key(url)
+    delay = default_delay
+    if h in ("g7.hu", "g7.p3k.hu"):
+        delay = max(delay, g7_delay)
+    if h == "archive.tilos.hu":
+        delay = max(delay, tilos_delay)
+
+    now = time.monotonic()
+    prev = host_last_ts.get(h, 0.0)
+    wait = (prev + delay) - now
+    if wait > 0:
+        time.sleep(wait)
+    host_last_ts[h] = time.monotonic()
+
+
+# ----------------- letöltés / resume / retry -----------------
 
 def get_total_size_bytes(existing: int, r: requests.Response) -> Optional[int]:
     """
@@ -383,104 +635,228 @@ def get_total_size_bytes(existing: int, r: requests.Response) -> Optional[int]:
     return None
 
 
+def is_permanent_http(status: int) -> bool:
+    """
+    Egyszerű heuristika:
+    - 404/410: nagyon gyakran végleges (törölt)
+    - 401/403/406: lehet WAF / header-probléma (nem mindig végleges)
+      -> itt nem tekintjük automatikusan véglegesnek, mert host-specifikus javítás segíthet
+    """
+    return status in (404, 410)
+
+
 def download_with_resume(
     session: requests.Session,
     url: str,
     out_path: Path,
     referer: str,
     progress_label: str = "",
+    connect_timeout: float = 20.0,
+    read_timeout: float = 900.0,
+    attempts: int = 8,
+    backoff: float = 1.3,
+    host_last_ts: Optional[Dict[str, float]] = None,
+    default_delay: float = 0.4,
+    g7_delay: float = 1.2,
+    tilos_delay: float = 1.0,
+    faklya_http_fallback_enabled: bool = True,
+    dead_links_path: Optional[Path] = None,
 ):
     """
-    Letöltés resume-mal + élő progress:
-    - százalék (ha ismert a total)
-    - letöltött/összes
-    - sebesség
-    - ETA
-    - start/end timestamp + elapsed
+    Letöltés resume-mal + élő progress + erősített retry/backoff:
+    - mid-stream megszakadásnál (ReadTimeout/ConnectionError/ChunkedEncodingError) is folytatja
+    - 416 esetén törli a .part-ot és újrakezdi
+    - 522/5xx esetén backoff + retry
+    - (opcionálisan) végleges hibákat dead_links.txt-be gyűjti
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + TMP_SUFFIX)
 
-    existing = tmp.stat().st_size if tmp.exists() else 0
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; PodkasztVisitedDownloader/1.0)",
-        "Referer": referer,
-    }
-    if existing > 0:
-        headers["Range"] = f"bytes={existing}-"
+    url0 = normalize_media_url(url)
 
-    started_at = local_ts()
-    t0 = time.monotonic()
+    # Host-rate-limit támogatás (ha adtunk dictet)
+    if host_last_ts is None:
+        host_last_ts = {}
 
-    r = session.get(url, stream=True, timeout=60, allow_redirects=True, headers=headers)
+    last_err = None
+    started_at_global = local_ts()
 
-    mode = "ab" if (existing > 0 and r.status_code == 206) else "wb"
-    if mode == "wb":
-        existing = 0  # újrakezdjük
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            # A URL-t minden próbánál normalizáljuk (biztonság kedvéért)
+            cur_url = normalize_media_url(url0)
 
-    r.raise_for_status()
+            # Egyes hostoknál érdemes rate-limitelni
+            ensure_host_delay(
+                cur_url,
+                host_last_ts=host_last_ts,
+                default_delay=default_delay,
+                g7_delay=g7_delay,
+                tilos_delay=tilos_delay,
+            )
 
-    total = get_total_size_bytes(existing, r)  # lehet None
-    downloaded = existing
-    session_bytes = 0  # az aktuális futásban letöltött byte (resume-nál fontos)
+            existing = tmp.stat().st_size if tmp.exists() else 0
 
-    last_print = 0.0
-    label = (progress_label or out_path.name or "download").strip()
+            headers = headers_for_url(cur_url, referer=referer)
+            if existing > 0:
+                headers["Range"] = f"bytes={existing}-"
 
-    print(f"[i] download start: {started_at} | {label}")
+            # --- HTTP kérés ---
+            r = session.get(
+                cur_url,
+                stream=True,
+                timeout=(connect_timeout, read_timeout),  # külön connect/read timeout
+                allow_redirects=True,
+                headers=headers,
+            )
 
-    with open(tmp, mode) as f:
-        for chunk in r.iter_content(chunk_size=1024 * 256):
-            if not chunk:
-                continue
-            f.write(chunk)
+            # 416: Range rossz (pl. a fájl megváltozott, vagy a .part nagyobb, mint a szerver oldali)
+            if r.status_code == 416 and existing > 0:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                # újrapróbáljuk Range nélkül
+                raise RuntimeError("range_416_reset")
 
-            downloaded += len(chunk)
-            session_bytes += len(chunk)
+            # Végleges 404/410: ne erőltessük sokáig (de logoljuk)
+            if is_permanent_http(r.status_code):
+                reason = f"HTTP_{r.status_code}"
+                if dead_links_path is not None:
+                    append_dead(dead_links_path, cur_url, reason)
+                raise RuntimeError(reason)
 
-            now = time.monotonic()
-            elapsed = max(0.001, now - t0)
-            speed = session_bytes / elapsed  # B/s
+            # 429 / 5xx / 522: ezek gyakran átmenetiek -> backoff
+            if r.status_code in (429, 500, 502, 503, 504, 522):
+                raise RuntimeError(f"retriable_http_{r.status_code}")
 
-            # ne frissítsünk túl gyakran
-            if (now - last_print) < 0.25:
-                continue
-            last_print = now
+            # Itt dobjuk a többi 4xx/5xx esetén (pl. 403/406/400)
+            r.raise_for_status()
 
+            # --- fájl mód (resume csak akkor, ha 206-ot ad) ---
+            mode = "ab" if (existing > 0 and r.status_code == 206) else "wb"
+            if mode == "wb":
+                existing = 0
+                # ha újrakezdünk, a régi tmp-t kidobjuk
+                if tmp.exists():
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            total = get_total_size_bytes(existing, r)  # lehet None
+            downloaded = existing
+            session_bytes = 0  # az aktuális attemptben letöltött byte
+
+            last_print = 0.0
+            label = (progress_label or out_path.name or "download").strip()
+
+            # csak az első attemptnél írjuk ki a "download start" sort (kevésbé spam)
+            if attempt == 1:
+                print(f"[i] download start: {started_at_global} | {label}")
+
+            t0 = time.monotonic()
+
+            with open(tmp, mode) as f:
+                for chunk in r.iter_content(chunk_size=1024 * 256):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+
+                    downloaded += len(chunk)
+                    session_bytes += len(chunk)
+
+                    now = time.monotonic()
+                    elapsed = max(0.001, now - t0)
+                    speed = session_bytes / elapsed  # B/s
+
+                    # ne frissítsünk túl gyakran
+                    if (now - last_print) < 0.25:
+                        continue
+                    last_print = now
+
+                    if total and total > 0:
+                        pct = (downloaded / total) * 100.0
+                        remain = max(0, total - downloaded)
+                        eta = (remain / speed) if speed > 1e-9 else 0.0
+                        msg = (
+                            f"\r{pct:6.2f}%  {fmt_bytes(downloaded)}/{fmt_bytes(total)}"
+                            f"  {fmt_bytes(speed)}/s  ETA {fmt_duration(eta)}  | {label}"
+                        )
+                    else:
+                        msg = f"\r{fmt_bytes(downloaded)}  {fmt_bytes(speed)}/s  | {label}"
+
+                    print(msg, end="", flush=True)
+
+            # siker: átmozgatjuk végleges helyre
+            tmp.replace(out_path)
+
+            finished_at = local_ts()
+            total_elapsed = time.monotonic() - t0
+            avg_speed = session_bytes / max(0.001, total_elapsed)
+
+            # progress sor lezárása
             if total and total > 0:
-                pct = (downloaded / total) * 100.0
-                remain = max(0, total - downloaded)
-                eta = (remain / speed) if speed > 1e-9 else 0.0
-                msg = (
-                    f"\r{pct:6.2f}%  {fmt_bytes(downloaded)}/{fmt_bytes(total)}"
-                    f"  {fmt_bytes(speed)}/s  ETA {fmt_duration(eta)}  | {label}"
+                print(
+                    f"\r100.00%  {fmt_bytes(downloaded)}/{fmt_bytes(total)}  "
+                    f"{fmt_bytes(avg_speed)}/s  ETA 00:00  | {label}"
                 )
             else:
-                msg = f"\r{fmt_bytes(downloaded)}  {fmt_bytes(speed)}/s  | {label}"
+                print()
 
-            print(msg, end="", flush=True)
+            print(f"[i] download end:   {finished_at} | {label} | elapsed {fmt_duration(total_elapsed)}")
+            return  # kész
 
-    tmp.replace(out_path)
+        except RuntimeError as e:
+            last_err = str(e)
 
-    finished_at = local_ts()
-    total_elapsed = time.monotonic() - t0
-    avg_speed = session_bytes / max(0.001, total_elapsed)
+            # "véglegesnek" tekintett hibáknál (404/410) ne próbálkozzunk tovább
+            if last_err.startswith("HTTP_404") or last_err.startswith("HTTP_410"):
+                raise
 
-    # zárjuk le a progress sort szépen
-    if total and total > 0:
-        print(
-            f"\r100.00%  {fmt_bytes(downloaded)}/{fmt_bytes(total)}  "
-            f"{fmt_bytes(avg_speed)}/s  ETA 00:00  | {label}"
-        )
-    else:
-        print()
+            # 416 reset: azonnali újrapróba (kisebb backoff)
+            if last_err == "range_416_reset":
+                if attempt < attempts:
+                    time.sleep(min(2.0, backoff))
+                    continue
+                raise
 
-    print(f"[i] download end:   {finished_at} | {label} | elapsed {fmt_duration(total_elapsed)}")
+            # Faklya fallback: ha engedélyezett és https-es volt
+            if faklya_http_fallback_enabled:
+                new_url = https_to_http_fallback(url0)
+                if new_url != url0:
+                    url0 = new_url  # a következő attempt már http-vel megy
+                    # kis várakozás
+                    time.sleep(min(2.5, backoff))
+                    continue
+
+        except (req_exc.ReadTimeout, req_exc.ConnectTimeout, req_exc.ConnectionError, req_exc.ChunkedEncodingError) as e:
+            last_err = f"{type(e).__name__}: {e}"
+
+            # Faklya fallback kapcsolat hibákra
+            if faklya_http_fallback_enabled:
+                new_url = https_to_http_fallback(url0)
+                if new_url != url0:
+                    url0 = new_url
+                    time.sleep(min(2.5, backoff))
+                    continue
+
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+
+        # --- retry/backoff, ha van még próbálkozás ---
+        if attempt >= attempts:
+            break
+
+        sleep_s = min(90.0, backoff * (2 ** (attempt - 1)))
+        print(f"\n[!] download retry {attempt}/{attempts} -> {last_err} | sleep {sleep_s:.1f}s")
+        time.sleep(sleep_s)
+
+    # ha idáig jutunk: kifogytunk a próbákból
+    raise RuntimeError(last_err or "download_failed_unknown")
 
 
-# --------- ÚJ: fájlnév-hossz kezelése (byte-alapon) ---------
+# --------- fájlnév-hossz kezelése (byte-alapon) ---------
 
 def get_name_max(dir_path: Path, fallback: int = 255) -> int:
     """
@@ -539,7 +915,6 @@ def build_safe_filename(out_dir: Path, producer: str, title: str, date: str, epi
     if ext not in AUDIO_EXTS:
         ext = ".mp3"
 
-    # Slugify (itt nem a limit a lényeg, hanem a tisztítás)
     producer_s = slugify(producer, max_len=4000)
     title_s = slugify(title, max_len=8000)
 
@@ -553,7 +928,6 @@ def build_safe_filename(out_dir: Path, producer: str, title: str, date: str, epi
     safe_stem = trim_utf8_to_bytes(stem, max_stem_bytes, suffix="___")
     filename = safe_stem + ext
 
-    # EXTRA: PATH_MAX védelem (teljes útvonal hossz)
     path_max = get_path_max(out_dir)
     full_path_bytes = len(str(out_dir / filename).encode("utf-8", errors="ignore"))
     full_tmp_path_bytes = len(str(out_dir / (filename + TMP_SUFFIX)).encode("utf-8", errors="ignore"))
@@ -574,7 +948,6 @@ def halve_filename_fallback(out_dir: Path, filename: str) -> str:
     if ext.lower() not in AUDIO_EXTS:
         ext = ".mp3"
 
-    # ha már volt rajta jelölés, ne halmozzuk
     base_stem = stem
     if base_stem.endswith("___"):
         base_stem = base_stem[:-3].rstrip(" ._-")
@@ -604,18 +977,44 @@ def halve_filename_fallback(out_dir: Path, filename: str) -> str:
     return new_filename
 
 
+# ----------------- MAIN -----------------
+
 def main():
     ap = argparse.ArgumentParser()
+
+    # Oldalazás / böngészés
     ap.add_argument("--base-url", default=BASE_URL_DEFAULT, help="base url of the podcast website")
     ap.add_argument("--start-page", type=int, default=1, help="start page of the podcast website")
     ap.add_argument("--end-page", type=int, default=2, help="end page of the podcast website")
-    ap.add_argument("--out", default="podcasts", help="output directory for the podcast files")
-    ap.add_argument("--visited", default="podkaszt_visited.txt", help="visited file for the podcast files")
     ap.add_argument("--profile", default=".pw-profile", help="Persistent browser profile folder (stores cookie consent)")
     ap.add_argument("--headful", action="store_true", help="show the browser window for debugging")
     ap.add_argument("--slowmo", type=int, default=0, help="ms slow motion for debugging (e.g. 150)")
+
+    # Epizód kiválasztás / audio URL
     ap.add_argument("--audio-wait", type=float, default=12.0, help="wait time for the audio url")
     ap.add_argument("--retries", type=int, default=3, help="How many times to attempt getting an audio URL per episode")
+
+    # Letöltés / hálózat
+    ap.add_argument("--connect-timeout", type=float, default=20.0, help="TCP connect timeout (seconds)")
+    ap.add_argument("--read-timeout", type=float, default=900.0, help="read timeout (seconds) - nagy mp3-nál emeld")
+    ap.add_argument("--download-attempts", type=int, default=8, help="download retry attempts per episode")
+    ap.add_argument("--http-retries", type=int, default=2, help="requests adapter retry (initial errors/status)")
+    ap.add_argument("--backoff", type=float, default=1.3, help="exponential backoff factor (seconds)")
+
+    # Rate-limit / host delay (522/406 csökkentése)
+    ap.add_argument("--default-delay", type=float, default=0.4, help="min delay between requests per host")
+    ap.add_argument("--g7-delay", type=float, default=1.2, help="extra delay for g7 hosts")
+    ap.add_argument("--tilos-delay", type=float, default=1.0, help="extra delay for archive.tilos.hu")
+
+    # Output / naplók
+    ap.add_argument("--out", default="podcasts", help="output directory for the podcast files")
+    ap.add_argument("--visited", default="podkaszt_visited.txt", help="visited file for the podcast files")
+    ap.add_argument("--timeouts", default="timeouts.txt", help="timeout/error log file")
+    ap.add_argument("--dead-links", default="dead_links.txt", help="permanent-ish bad links (404/410)")
+
+    # Speciális
+    ap.add_argument("--no-faklya-http-fallback", action="store_true", help="disable https->http fallback for faklyaradio")
+
     args = ap.parse_args()
 
     run_start = datetime.now().astimezone()
@@ -625,17 +1024,19 @@ def main():
     out_dir = Path(args.out)
     visited_path = Path(args.visited)
     profile_dir = Path(args.profile)
-    timeouts_path = Path("timeouts.txt")
+    timeouts_path = Path(args.timeouts)
+    dead_links_path = Path(args.dead_links)
 
-    # fontos: out_dir létezzen, különben a pathconf néha nem megbízható
     out_dir.mkdir(parents=True, exist_ok=True)
-
     visited = load_visited(visited_path)
 
     print(f"[i] Base:    {base_url}")
     print(f"[i] Out:     {out_dir.resolve()}")
     print(f"[i] Visited: {visited_path.resolve()} (loaded {len(visited)})")
     print(f"[i] Profile: {profile_dir.resolve()}")
+
+    # host rate-limit állapot (host -> last_time)
+    host_last_ts: Dict[str, float] = {}
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -660,7 +1061,8 @@ def main():
 
         page.on("response", on_response)
 
-        session = requests.Session()
+        # requests session retry-vel
+        session = build_http_session(args.http_retries, args.backoff)
 
         # Open base page & accept cookies
         page.goto(base_url, wait_until="domcontentloaded")
@@ -668,7 +1070,7 @@ def main():
         if accept_cookies_if_present(page):
             print("[i] Cookie consent accepted.")
 
-        # Navigate to start page by clicking numbers (1 -> 2 -> ... -> start_page)
+        # Navigate to start page
         current = 1
         if args.start_page > 1:
             print(f"[i] skipping to start-page {args.start_page} ...")
@@ -680,7 +1082,6 @@ def main():
                 ok = try_goto_page_by_url(page, base_url, target)
 
             if not ok:
-                # retry párszor, mert nagy oldalszámnál random szokott lenni
                 retry_ok = False
                 for _ in range(3):
                     page.wait_for_timeout(1200)
@@ -698,7 +1099,7 @@ def main():
             current = target
             print(f"skipped to page {current}")
 
-        # Process pages start_page..end_page
+        # Process pages
         for page_no in range(args.start_page, args.end_page + 1):
             accept_cookies_if_present(page)
             page.wait_for_timeout(300)
@@ -734,7 +1135,6 @@ def main():
 
                 episode_key = sha1(f"{title}|{producer}|{date}")
 
-                # Skip if visited
                 if episode_key in visited:
                     continue
 
@@ -742,6 +1142,7 @@ def main():
 
                 # Select by clicking title
                 try:
+                    wait_for_overlays(page)
                     tds.nth(ti).click(timeout=2500)
                 except Exception as e:
                     reason = f"select failed: {e}"
@@ -752,6 +1153,7 @@ def main():
 
                 # Try to start playback by clicking the icon column
                 try:
+                    wait_for_overlays(page)
                     tds.nth(0).click(timeout=1500)
                 except Exception:
                     pass
@@ -774,6 +1176,7 @@ def main():
 
                     # nudge playback again
                     try:
+                        wait_for_overlays(page)
                         tds.nth(0).click(timeout=1500)
                     except Exception:
                         pass
@@ -786,19 +1189,22 @@ def main():
                     append_timeout(timeouts_path, filename_nf, date, producer, title, episode_key, reason)
                     continue
 
-                # Sync cookies before downloading (important for some hosts)
+                # Sync cookies before downloading
                 try:
                     sync_cookies_to_requests(context, session)
                 except Exception:
                     pass
 
+                # URL normalizálás (host='http', anchor decode, g7 rewrite, stb.)
+                audio_url = normalize_media_url(audio_url)
+
                 ext = guess_ext_from_url(audio_url)
 
-                # fájlnév biztonságos építése (ha túl hosszú, '___'-t kap)
+                # Biztonságos fájlnév
                 filename = build_safe_filename(out_dir, producer, title, date, episode_key, ext)
                 out_path = out_dir / filename
 
-                # If already exists, mark visited and skip
+                # Ha már letöltöttük, skip
                 exists_nonempty = False
                 for _fs_try in range(6):
                     try:
@@ -821,21 +1227,35 @@ def main():
 
                 downloaded_ok = False
                 last_err = ""
+
+                # Fájlrendszer hiba esetén (filename too long) még rövidítünk párszor
                 for _fs_try in range(6):
                     try:
                         print(f"[+] downloading: {out_path.name}")
                         download_with_resume(
-                            session,
-                            audio_url,
-                            out_path,
+                            session=session,
+                            url=audio_url,
+                            out_path=out_path,
                             referer=base_url,
                             progress_label=out_path.name,
+                            connect_timeout=args.connect_timeout,
+                            read_timeout=args.read_timeout,
+                            attempts=args.download_attempts,
+                            backoff=args.backoff,
+                            host_last_ts=host_last_ts,
+                            default_delay=args.default_delay,
+                            g7_delay=args.g7_delay,
+                            tilos_delay=args.tilos_delay,
+                            faklya_http_fallback_enabled=(not args.no_faklya_http_fallback),
+                            dead_links_path=dead_links_path,
                         )
                         visited.add(episode_key)
                         append_visited(visited_path, episode_key, date, producer, title)
                         downloaded_ok = True
                         break
+
                     except OSError as e:
+                        # filename too long
                         if getattr(e, "errno", None) == 36:
                             print("fallback: fajlnev tul hosszu, rovidites")
                             filename = halve_filename_fallback(out_dir, filename)
@@ -843,6 +1263,7 @@ def main():
                             continue
                         last_err = f"OSError: {e}"
                         break
+
                     except Exception as e:
                         last_err = str(e)
                         break
@@ -858,13 +1279,12 @@ def main():
 
             print(f"letoltve {page_ok}/{page_candidates}")
 
-            # go next page by clicking the next number
+            # next page
             if page_no < args.end_page:
                 ok = click_page_number(page, page_no + 1)
                 if not ok:
                     ok = try_goto_page_by_url(page, base_url, page_no + 1)
                 if not ok:
-                    # retry párszor
                     retry_ok = False
                     for _ in range(3):
                         page.wait_for_timeout(1200)
@@ -875,7 +1295,7 @@ def main():
                             retry_ok = True
                             break
                     if not retry_ok:
-                        raise RuntimeError(f"Could not click pagination number {page_no+1}")
+                        raise RuntimeError(f"Could not click pagination number {page_no + 1}")
                 page.wait_for_timeout(700)
 
         context.close()
@@ -888,3 +1308,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #python podkaszt_hu.py --start-page 1 --end-page 50 --retries 6 --audio-wait 25 --connect-timeout 20 --read-timeout 1200 --download-attempts 8 --backoff 1.3 --g7-delay 1.5 --tilos-delay 1.0 --default-delay 0.4 --out /home/datasets/experiments/experiment-podcasts/podkaszt_hu
