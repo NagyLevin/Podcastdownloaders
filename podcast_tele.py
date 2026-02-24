@@ -116,8 +116,9 @@ def main():
             if not episode_urls:
                 print("Nem találtam letölthető epizódokat ezen az oldalon.")
                 break
-
+            
             print(f"Talált epizódok száma az oldalon: {len(episode_urls)}")
+            letoltve = 0
 
             for i, ep_url in enumerate(episode_urls):
                 max_retries = 3
@@ -233,9 +234,11 @@ def main():
                         download_file_with_requests(audio_src, filepath, page)
                         
                         print(f":) Sikeres letöltés: {filename}")
+                        letoltve +=1
                         with open(visited_file, 'a', encoding='utf-8') as f:
                             f.write(f"{title_hash}\t{title}\n")
                         visited.add(title_hash)
+                        
                         total_downloaded_in_session += 1
                         
                         break # Minden sikeres, kilépünk a retry hurokból!
@@ -246,6 +249,7 @@ def main():
                             time.sleep(3)
                         else:
                             print(f":( Végleges hiba 3 próbálkozás után az epizódnál: {e}")
+            print(f"Sikeresen letolve: {letoltve}/{len(episode_urls)}")
 
         browser.close()
         
