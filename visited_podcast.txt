@@ -14,6 +14,7 @@ f479ecb6	Kinek a felelőssége? Hüse Lajos a sokszoros hátránnyal születette
 b122fc78	91. adás - Villany kamion teszt
 42e9275d	Kelemen Lili: a vendégek zöme ilyenkor a hoteleket és a fürdővárosokat keresi
 59111c21	#9 Győri Beatrix; Tudatos pályaelhagyásból épített beauty márka ✨🧴 Szépségipar Kulisszatitkai
+fefb497f	#166 - Keszthelyi Anna: A túlsúly nem lustaság, hanem seb
 a732cf95	ChatGPT reklámok? Üdv a „Monetizált AI” korszakban
 849956d4	Robbant az akkubotrány, de ki a tégla a kormányban? - Ez Viszont Privát
 25de0032	Mire készül a Góbé?
@@ -27,6 +28,7 @@ edbf0ad2	Ágyról ágyra
 806666d4	Leadership Híradó #43: Na de ma teremtettél-e már értéket a shareholdereknek?
 65c8c331	A Vörös Budapest titkai
 73796bb0	Orbán Viktor nem félti az országot egy Tisza-kormánytól – Ez Viszont Privát
+f517477f	Komix Kölyök bemutatja: Becskei Gábor és Vadas Máté - kk#21 spp#168
 4dfe51e2	Telkók románca: míg a hatóság el nem választ (weekly #79)
 2bc1175f	Hová vezet ez a nagy telkó-románc? (weekly #79)
 b40f8b96	Bennünk élnek 2.: Döntések és erőforrások (vendég: Murinai Angéla)

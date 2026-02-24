@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import os
 import re
+import time
 import urllib.parse
 from datetime import datetime
 from urllib.parse import urljoin
@@ -62,6 +63,9 @@ def main():
                     visited.add(parts[0])
 
     current_year = datetime.now().year
+    
+    # --- ÚJ: Sikeres letöltések számlálója ---
+    total_downloaded_in_session = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
@@ -92,20 +96,16 @@ def main():
                 print(f"Nincsenek találatok a(z) {page_num}. oldalon, vagy a végére értünk.")
                 break
 
-            # --- JAVÍTVA: URL-ek okosabb összegyűjtése ---
             episode_urls = []
             links = page.locator("a").all()
             for link in links:
                 href = link.get_attribute("href")
                 if href:
-                    # SZIGORÍTÁS: Csak a belső epizód linkek érdekelnek minket!
                     if href.startswith("/podcast/") or href.startswith("https://podcast.hu/podcast/"):
-                        # Eltávolítjuk az esetleges query stringeket (?v=...) a pontosság miatt
                         clean_href = href.split("?")[0]
                         parts = [part for part in clean_href.split("/") if part]
                         try:
                             podcast_idx = parts.index("podcast")
-                            # Ellenőrizzük, hogy ez tényleg epizód (podcast / csatorna / epizod_id)
                             if len(parts) >= podcast_idx + 3: 
                                 full_url = urljoin(page.url, href)
                                 if full_url not in episode_urls:
@@ -120,82 +120,83 @@ def main():
             print(f"Talált epizódok száma az oldalon: {len(episode_urls)}")
 
             for i, ep_url in enumerate(episode_urls):
-                try:
+                max_retries = 3
+                # --- ÚJ: Újrapróbálkozó (Retry) Hurok ---
+                for attempt in range(1, max_retries + 1):
                     try:
-                        page.goto(ep_url, timeout=15000)
-                        page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except Exception as e:
-                        if ".m4a" in ep_url.lower() or ".mp3" in ep_url.lower() or "anchor.fm" in ep_url:
-                            pass
-                        else:
-                            print(f":( Oldal betöltési hiba: {ep_url} ({e})")
-                            continue
-
-                    try:
-                        page.wait_for_selector("h1.p-episode__title--desktop, h1:visible, video, audio", timeout=5000)
-                    except PwTimeoutError:
-                        pass
-                        
-                    title_loc = page.locator("h1.p-episode__title--desktop")
-                    if title_loc.count() == 0:
-                        title_loc = page.locator("h1:visible")
-                        
-                    date_str = ""
-                    author = "Ismeretlen_Eloado"
-
-                    if title_loc.count() > 0:
-                        title = title_loc.first.inner_text().strip()
-                        title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:8]
-                        
-                        minutes_locator = page.locator(".p-episode__minutes").first
-                        if minutes_locator.count() > 0:
-                            date_text = minutes_locator.inner_text().strip()
-                            if '|' in date_text:
-                                date_str = date_text.split('|')[0].strip()
+                        try:
+                            page.goto(ep_url, timeout=15000)
+                            page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        except Exception as e:
+                            if ".m4a" in ep_url.lower() or ".mp3" in ep_url.lower() or "anchor.fm" in ep_url:
+                                pass
                             else:
-                                date_str = date_text
-                                
-                        if len(date_str) > 20:
-                            date_str = "" 
+                                raise Exception(f"Oldal betöltési hiba: {ep_url} ({e})")
 
-                        if not date_str:
-                            body_text = page.locator("body").inner_text()
-                            date_match = re.search(r'([A-ZÁÉÍÓÖŐÚÜŰa-záéíóöőúüű]+\s+\d{1,2}\.)\s*\|', body_text)
-                            if date_match:
-                                date_str = date_match.group(1).strip()
-                                
-                        author_locator = page.locator(".p-episode__author").first
-                        if author_locator.count() > 0:
-                            found_author = author_locator.inner_text().strip()
-                            if found_author: 
-                                author = found_author
-                    else:
-                        decoded_url = urllib.parse.unquote(ep_url)
-                        title_fallback = decoded_url.split("/")[-1].split("?")[0]
-                        if not title_fallback or len(title_fallback) < 3:
-                            title_fallback = f"Episode_{i}"
+                        try:
+                            page.wait_for_selector("h1.p-episode__title--desktop, h1:visible, video, audio", timeout=5000)
+                        except PwTimeoutError:
+                            pass
                             
-                        title = "Kulsos_Epizod_" + title_fallback
-                        title_hash = hashlib.md5(ep_url.encode('utf-8')).hexdigest()[:8]
+                        title_loc = page.locator("h1.p-episode__title--desktop")
+                        if title_loc.count() == 0:
+                            title_loc = page.locator("h1:visible")
+                            
                         date_str = ""
-                    
-                    if title_hash in visited:
-                        print(f"Már letöltve, ugrás: {title}")
-                        continue 
+                        author = "Ismeretlen_Eloado"
 
-                    safe_date = ""
-                    if date_str:
-                        if not re.search(r'\d{4}', date_str):
-                            date_str = f"{current_year}. {date_str}"
-                        safe_date = sanitize_filename(date_str) + "_"
+                        if title_loc.count() > 0:
+                            title = title_loc.first.inner_text().strip()
+                            title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:8]
+                            
+                            minutes_locator = page.locator(".p-episode__minutes").first
+                            if minutes_locator.count() > 0:
+                                date_text = minutes_locator.inner_text().strip()
+                                if '|' in date_text:
+                                    date_str = date_text.split('|')[0].strip()
+                                else:
+                                    date_str = date_text
+                                    
+                            if len(date_str) > 20:
+                                date_str = "" 
 
-                    safe_author = truncate_text(sanitize_filename(author), 50)
-                    safe_title = truncate_text(sanitize_filename(title), 100) 
-                    
-                    print(f"Feldolgozás: {title} | Előadó: {author}")
+                            if not date_str:
+                                body_text = page.locator("body").inner_text()
+                                date_match = re.search(r'([A-ZÁÉÍÓÖŐÚÜŰa-záéíóöőúüű]+\s+\d{1,2}\.)\s*\|', body_text)
+                                if date_match:
+                                    date_str = date_match.group(1).strip()
+                                    
+                            author_locator = page.locator(".p-episode__author").first
+                            if author_locator.count() > 0:
+                                found_author = author_locator.inner_text().strip()
+                                if found_author: 
+                                    author = found_author
+                        else:
+                            decoded_url = urllib.parse.unquote(ep_url)
+                            title_fallback = decoded_url.split("/")[-1].split("?")[0]
+                            if not title_fallback or len(title_fallback) < 3:
+                                title_fallback = f"Episode_{i}"
+                                
+                            title = "Kulsos_Epizod_" + title_fallback
+                            title_hash = hashlib.md5(ep_url.encode('utf-8')).hexdigest()[:8]
+                            date_str = ""
+                        
+                        if title_hash in visited:
+                            print(f"Már letöltve, ugrás: {title}")
+                            break # Kilépünk a retry hurokból, hisz ez már megvan
 
-                    download_success = False
-                    try:
+                        safe_date = ""
+                        if date_str:
+                            if not re.search(r'\d{4}', date_str):
+                                date_str = f"{current_year}. {date_str}"
+                            safe_date = sanitize_filename(date_str) + "_"
+
+                        safe_author = truncate_text(sanitize_filename(author), 50)
+                        safe_title = truncate_text(sanitize_filename(title), 100) 
+                        
+                        if attempt == 1:
+                            print(f"Feldolgozás: {title} | Előadó: {author}")
+
                         audio_src = ""
                         if page.locator("audio").count() > 0:
                             audio_src = page.locator("audio").first.get_attribute("src")
@@ -214,37 +215,45 @@ def main():
                             elif ".m4a" in ep_url.lower() or ".mp3" in ep_url.lower() or "anchor.fm" in ep_url.lower():
                                 audio_src = ep_url
 
-                        if audio_src:
-                            if not audio_src.startswith("http"):
-                                audio_src = urljoin(page.url, audio_src)
+                        if not audio_src:
+                            # Ha nem találjuk, saját magunk "dobjuk" a hibát, hogy beinduljon a retry!
+                            raise ValueError("Nincs felismerhető audio lejátszó vagy link ezen az oldalon.")
+
+                        if not audio_src.startswith("http"):
+                            audio_src = urljoin(page.url, audio_src)
+                        
+                        ext = ".mp3"
+                        if ".m4a" in audio_src.lower():
+                            ext = ".m4a"
                             
-                            ext = ".mp3"
-                            if ".m4a" in audio_src.lower():
-                                ext = ".m4a"
-                                
-                            filename = f"{safe_date}{safe_author}_{safe_title}_{title_hash}{ext}"
-                            filepath = os.path.join(args.out, filename)
+                        filename = f"{safe_date}{safe_author}_{safe_title}_{title_hash}{ext}"
+                        filepath = os.path.join(args.out, filename)
 
-                            print(f"Letöltés megkezdése a háttérben ({ext})...")
-                            download_file_with_requests(audio_src, filepath, page)
-                            download_success = True
-                        else:
-                            print(f":( Nincs felismerhető audio lejátszó vagy link ezen az oldalon.")
-
-                    except Exception as e:
-                        print(f":( Hiba a letöltés során: {e}")
-
-                    if download_success:
+                        print(f"Letöltés megkezdése a háttérben ({ext})...")
+                        download_file_with_requests(audio_src, filepath, page)
+                        
                         print(f":) Sikeres letöltés: {filename}")
                         with open(visited_file, 'a', encoding='utf-8') as f:
                             f.write(f"{title_hash}\t{title}\n")
                         visited.add(title_hash)
+                        total_downloaded_in_session += 1
                         
-                except Exception as e:
-                    print(f":() Hiba történt az epizód feldolgozásakor: {e}")
+                        break # Minden sikeres, kilépünk a retry hurokból!
+
+                    except Exception as e:
+                        if attempt < max_retries:
+                            print(f"  [!] Hiba ({e}). Újrapróbálkozás {attempt}/{max_retries}... (vár 3 másodpercet)")
+                            time.sleep(3)
+                        else:
+                            print(f":( Végleges hiba 3 próbálkozás után az epizódnál: {e}")
 
         browser.close()
-        print("\n Folyamat befejezve!")
+        
+        # --- ÚJ: Összesítő kiírása a legvégén ---
+        print("\n" + "="*40)
+        print(f"!Folyamat befejezve!")
+        print(f"-> A mostani futás során sikeresen letöltött epizódok száma: {total_downloaded_in_session} db.")
+        print("="*40 + "\n")
 
 if __name__ == "__main__":
     main()
