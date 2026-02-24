@@ -1,11 +1,13 @@
 import argparse
 import json
 import os
+import random
 import re
 import time
 from urllib.parse import urlparse, urljoin
 
 import requests
+from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError as ReqConnectionError, HTTPError
 from playwright.sync_api import sync_playwright
 
 
@@ -20,19 +22,22 @@ DEFAULT_HEADERS = {
 
 ATALON_BASE = "https://atalon.hu"
 
-# Tipikus epizód slug: something-s01-e03 (de néha s1-e3 is lehet)
+# /garami-s01-e03
 EPISODE_SLUG_RE = re.compile(r"/([a-z0-9-]+-s\d+-e\d+)\b", re.IGNORECASE)
 
-# Dátum a kártyán: 2021. 11. 17.
+# 2021. 11. 17.
 HU_DATE_RE = re.compile(r"\b(\d{4})\.\s*(\d{2})\.\s*(\d{2})\.?\b")
 
-# Időtartam: 34:52 vagy 01:04:48
+# 34:52 vagy 01:04:48
 DUR_RE = re.compile(r"\b(\d{1,2}:\d{2})(:\d{2})?\b")
 
 AUDIO_URL_RE = re.compile(
     r'https://[^\s"<>]*?\.(?:mp3|m4a|wav|aac)[^\s"<>]*',
     re.IGNORECASE
 )
+
+# Biztonsági sapka a predikcióra
+MAX_PREDICT_EP = 500
 
 
 # -------------------- basic utils --------------------
@@ -70,6 +75,10 @@ def normalize_date(date_str: str | None) -> str:
     if re.match(r"^\d{4}-\d{2}-\d{2}", date_str):
         return date_str[:10]
     return "unknown-date"
+
+
+def is_episode_url(u: str) -> bool:
+    return bool(EPISODE_SLUG_RE.search(urlparse(u).path or ""))
 
 
 # -------------------- visited --------------------
@@ -132,10 +141,9 @@ def mark_done_in_input_file(input_path: str, done_urls: set[str]) -> None:
         f.writelines(out_lines)
 
 
-# -------------------- requests: extract & download (episode page -> audio url) --------------------
+# -------------------- requests: episode page -> audio url -> download --------------------
 
 def extract_audio_url_from_html(html: str) -> str | None:
-    # __NEXT_DATA__
     m = re.search(
         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
         html,
@@ -147,7 +155,6 @@ def extract_audio_url_from_html(html: str) -> str | None:
         if url_match:
             return url_match.group(0).replace("\\u0026", "&")
 
-    # fallback
     url_match = AUDIO_URL_RE.search(html)
     if url_match:
         return url_match.group(0).replace("\\u0026", "&")
@@ -193,12 +200,41 @@ def download_audio(session: requests.Session, audio_url: str, out_path: str, ref
     headers = dict(DEFAULT_HEADERS)
     headers["Referer"] = referer
 
-    with session.get(audio_url, stream=True, headers=headers, timeout=180) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+    # gyors connect fail, hosszú read
+    timeout = (15, 300)  # (connect, read)
+
+    max_tries = 6
+    base_sleep = 2.0
+
+    last_err = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            with session.get(audio_url, stream=True, headers=headers, timeout=timeout) as r:
+                r.raise_for_status()
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            return
+        except (ConnectTimeout, ReadTimeout, ReqConnectionError, HTTPError) as e:
+            last_err = e
+
+            # 4xx (kivéve 429) esetén általában felesleges újrapróbálni
+            if isinstance(e, HTTPError):
+                try:
+                    code = e.response.status_code
+                    if 400 <= code < 500 and code != 429:
+                        raise
+                except Exception:
+                    pass
+
+            sleep_s = base_sleep * (2 ** (attempt - 1))
+            sleep_s = min(sleep_s, 60.0) + random.uniform(0, 0.8)
+            print(f"  - Letöltési hiba (próba {attempt}/{max_tries}): {e}")
+            print(f"  - Újrapróbálom {sleep_s:.1f} mp múlva...")
+            time.sleep(sleep_s)
+
+    raise RuntimeError(f"Letöltés sikertelen {max_tries} próbálkozás után: {audio_url}\nUtolsó hiba: {last_err}")
 
 
 def download_episode_requests(
@@ -208,38 +244,52 @@ def download_episode_requests(
     visited: dict,
     source_slug: str,
     known_title: str | None = None,
-    known_date: str | None = None
+    known_date: str | None = None,
+    predicted: bool = False
 ) -> bool:
     if episode_url in visited:
         print(f"Epizód kihagyva (visited): {episode_url}")
         return True
 
-    print(f"Epizód elemzése: {episode_url}")
+    print(f"Epizód elemzése: {episode_url}" + (" [PREDICT]" if predicted else ""))
     r = session.get(episode_url, headers=DEFAULT_HEADERS, timeout=45)
+
     if r.status_code == 404:
-        print("  - 404 (nincs ilyen epizód URL) -> kihagyom")
-        return False
+        visited[episode_url] = {"missing": True, "reason": "404"}
+        print("  - 404 (nincs ilyen) -> jelölöm missing-ként")
+        return True if predicted else False
+
     r.raise_for_status()
     html = r.text
 
     audio_url = extract_audio_url_from_html(html)
     if not audio_url:
-        print("  - Nem találtam audio URL-t (__NEXT_DATA__/HTML).")
-        return False
+        visited[episode_url] = {"missing": True, "reason": "no_audio"}
+        print("  - Nincs audio URL -> jelölöm missing-ként")
+        return True if predicted else False
 
-    title = known_title or guess_title_from_html(html) or slug_from_url(episode_url)
+    ep_slug = slug_from_url(episode_url)
+
+    title = known_title or guess_title_from_html(html) or ep_slug
+    if (title or "").strip().upper() == "EPIZÓDOK":
+        title = ep_slug
+
     date_raw = known_date or guess_date_from_html(html)
     date_norm = normalize_date(date_raw)
 
-    ep_slug = slug_from_url(episode_url)
     ext = extension_from_audio_url(audio_url)
-
     filename = build_output_filename(date_norm, source_slug, ep_slug, title, ext)
     out_path = os.path.join(out_dir, filename)
 
     print(f"  - Audio: {audio_url}")
     print(f"  - Fájl: {out_path}")
-    download_audio(session, audio_url, out_path, referer=episode_url)
+
+    try:
+        download_audio(session, audio_url, out_path, referer=episode_url)
+    except Exception as e:
+        print(f"  - Letöltési hiba: {e}")
+        # ne dőljön el a seed, csak jelezzük, hogy ez nem sikerült
+        return False
 
     visited[episode_url] = {
         "title": title,
@@ -294,6 +344,67 @@ def handle_consent(page, timeout_ms: int = 15000) -> bool:
         page.wait_for_timeout(400)
 
     return False
+
+
+def select_all_seasons_if_present(page) -> bool:
+    # van-e egyáltalán "évad" a lapon?
+    try:
+        if page.locator("text=/évad/i").count() == 0:
+            return False
+    except Exception:
+        return False
+
+    # megnyitó elem: Összes évad / 14. évad / bármi évad
+    trigger_selectors = [
+        "text=/\\b\\d+\\.\\s*évad\\b/i",
+        "text=/Összes\\s+évad/i",
+        "button:has-text('évad')",
+        "[role='button']:has-text('évad')",
+    ]
+
+    trigger = None
+    for sel in trigger_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                trigger = loc
+                break
+        except Exception:
+            pass
+
+    if trigger is None:
+        return False
+
+    try:
+        trigger.click(timeout=1500, force=True)
+        page.wait_for_timeout(500)
+    except Exception:
+        return False
+
+    # katt az "Összes évad" opcióra
+    clicked = False
+    try:
+        opts = page.locator("text=/Összes\\s+évad/i")
+        n = opts.count()
+        for i in range(n):
+            el = opts.nth(i)
+            if el.is_visible():
+                el.scroll_into_view_if_needed()
+                el.click(timeout=1500, force=True)
+                clicked = True
+                break
+    except Exception:
+        pass
+
+    if clicked:
+        page.wait_for_timeout(1200)
+
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    return clicked
 
 
 def click_mutass_tobbet(page) -> bool:
@@ -364,25 +475,16 @@ def scroll_to_top_everywhere(page) -> None:
     page.wait_for_timeout(800)
 
 
-def estimate_episode_count(page) -> int:
-    # Tüzetes ellenőrzés: teljes oldal szövegében hány dátum szerepel
+def estimate_episode_count_by_dates(page) -> int:
     try:
         txt = page.evaluate("() => document.body ? (document.body.innerText || '') : ''")
-        if not txt:
-            return 0
-        return len(HU_DATE_RE.findall(txt))
+        return len(HU_DATE_RE.findall(txt or ""))
     except Exception:
         return 0
 
 
 def detect_creator_page(page) -> bool:
-    """
-    Creator oldal jelleg:
-    - sokszor nincs tömeges dátum/időtartam lista
-    - és a fő tartalomban van PODCASTOK szekciócím
-    """
     try:
-        # "PODCASTOK" cím NEM a menüben: kerüljük nav/aside elemeket
         has_podcastok_heading = page.evaluate("""
         () => {
           const els = Array.from(document.querySelectorAll('h1,h2,h3,div,span'))
@@ -393,16 +495,11 @@ def detect_creator_page(page) -> bool:
     except Exception:
         has_podcastok_heading = False
 
-    # ha nincs legalább 3 dátum a lapon, nagyon gyanús, hogy nem epizódlista
-    ep_count_est = estimate_episode_count(page)
+    ep_count_est = estimate_episode_count_by_dates(page)
     return bool(has_podcastok_heading) and ep_count_est < 3
 
 
 def extract_visible_episode_cards_dom(page) -> list[dict]:
-    """
-    DOM-ból: olyan "kártyákat" keresünk, amiben van dátum és valamilyen atalon.hu link.
-    Nem ragaszkodunk szigorúan a -s-e mintához, de ha van, előny.
-    """
     js = r"""
     () => {
       const reDate = /\b(\d{4})\.\s*(\d{2})\.\s*(\d{2})\.?\b/;
@@ -411,41 +508,33 @@ def extract_visible_episode_cards_dom(page) -> list[dict]:
       const out = [];
       const seen = new Set();
 
-      // gyűjtsünk minden elemet, amelynek a szövegében van dátum (ez tipikusan az epizód sor)
       const all = Array.from(document.querySelectorAll('body *'));
       for (const el of all) {
         const txt = (el.innerText || '').trim();
         if (!txt) continue;
         if (!reDate.test(txt)) continue;
 
-        // menjünk fel pár szintet, hogy megtaláljuk a "kártyát"
         let card = el;
         for (let i=0; i<8 && card; i++) {
-          // legyen benne időtartam is (epizódokra jellemző)
           const cTxt = (card.innerText || '');
           if (reDate.test(cTxt) && reDur.test(cTxt)) break;
           card = card.parentElement;
         }
         if (!card) continue;
 
-        // kártyán belül keressünk linket
         const links = Array.from(card.querySelectorAll('a[href]'))
           .map(a => a.href)
           .filter(h => typeof h === 'string' && h.startsWith('http'));
 
         if (links.length === 0) continue;
 
-        // title: próbáljuk a kártya elejéről (első sor)
         let title = '';
         const lines = (card.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
         if (lines.length > 0) title = lines[0];
 
-        // date: első találat
         const m = (card.innerText || '').match(reDate);
         const date = m ? `${m[1]}.${m[2]}.${m[3]}.` : '';
 
-        // válasszunk egy "legjobb" linket:
-        // - preferáljuk azt, ami atalon.hu és NEM image/assets
         let best = '';
         for (const h of links) {
           if (!h.includes('atalon.hu')) continue;
@@ -470,19 +559,17 @@ def extract_visible_episode_cards_dom(page) -> list[dict]:
         return []
 
 
-def scrape_episode_urls_from_json_text(text: str) -> set[str]:
+def scrape_episode_urls_from_text(text: str) -> set[str]:
     out = set()
     if not text:
         return out
 
-    # abs URL
     for m in re.finditer(r"https?://atalon\.hu/[a-z0-9/_\-]+", text, flags=re.IGNORECASE):
         u = m.group(0)
         if "/_next/" in u or "/assets" in u:
             continue
         out.add(u)
 
-    # rel slug -sXX-eYY
     for m in EPISODE_SLUG_RE.finditer(text):
         slug = m.group(1)
         out.add(urljoin(ATALON_BASE, "/" + slug))
@@ -490,62 +577,80 @@ def scrape_episode_urls_from_json_text(text: str) -> set[str]:
     return out
 
 
-def fill_gaps_episode_urls(urls: set[str]) -> set[str]:
-    """
-    Ha van sok ...-s01-eXX URL, akkor kitaláljuk a hiányzó e számokat.
-    Példa: megvan e01,e02,e04,e05 -> legeneráljuk e03-at is.
-    """
-    # group by (prefix up to -s..., seasonDigitsLen, epDigitsLen)
+def build_predict_list_max_to_zero(found_urls: set[str], meta_map: dict[str, dict]) -> list[dict]:
     groups = {}
+    leftovers = set(found_urls)
 
-    for u in urls:
-        p = urlparse(u).path.strip("/")
-        m = re.match(r"^(.*)-s(\d+)-e(\d+)$", p, flags=re.IGNORECASE)
+    for u in found_urls:
+        path = urlparse(u).path.strip("/")
+        m = re.match(r"^(.*)-s(\d+)-e(\d+)$", path, flags=re.IGNORECASE)
         if not m:
             continue
         prefix, s_str, e_str = m.group(1), m.group(2), m.group(3)
-        key = (prefix.lower(), s_str)  # season string fixed
-        groups.setdefault(key, {"e": set(), "e_len": 0})
-        groups[key]["e"].add(int(e_str))
+        key = (prefix.lower(), s_str)
+        groups.setdefault(key, {"prefix": prefix, "season": s_str, "max_e": -1, "e_len": 1})
+        groups[key]["max_e"] = max(groups[key]["max_e"], int(e_str))
         groups[key]["e_len"] = max(groups[key]["e_len"], len(e_str))
+        leftovers.discard(u)
 
-    new_urls = set(urls)
-    for (prefix, s_str), info in groups.items():
-        if len(info["e"]) < 3:
+    out = []
+    seen = set()
+
+    for _, g in groups.items():
+        max_e = g["max_e"]
+        if max_e < 0:
             continue
-        e_min, e_max = min(info["e"]), max(info["e"])
-        e_len = info["e_len"] or 1
+        if max_e > MAX_PREDICT_EP:
+            print(f"  - Figyelem: max epizód {max_e}, sapka {MAX_PREDICT_EP}-re vágva")
+            max_e = MAX_PREDICT_EP
 
-        for e in range(e_min, e_max + 1):
-            if e not in info["e"]:
-                ep = str(e).zfill(e_len)
-                slug = f"{prefix}-s{s_str}-e{ep}"
-                new_urls.add(urljoin(ATALON_BASE, "/" + slug))
+        e_len = g["e_len"]
+        prefix = g["prefix"]
+        s_str = g["season"]
 
-    return new_urls
+        for e in range(max_e, -1, -1):
+            ep = str(e).zfill(e_len)
+            slug = f"{prefix}-s{s_str}-e{ep}"
+            url = urljoin(ATALON_BASE, "/" + slug)
+
+            if url in seen:
+                continue
+            seen.add(url)
+
+            meta = meta_map.get(url, {})
+            out.append({
+                "url": url,
+                "title": meta.get("title"),
+                "date": meta.get("date"),
+                "predicted": (url not in found_urls),
+            })
+
+    for u in sorted(leftovers):
+        if u in seen:
+            continue
+        seen.add(u)
+        meta = meta_map.get(u, {})
+        out.append({"url": u, "title": meta.get("title"), "date": meta.get("date"), "predicted": False})
+
+    return out
 
 
 def collect_episodes_hardcore(show_url: str, headful: bool) -> tuple[str, list[dict]]:
-    """
-    Visszaadja: (ptype, episodes)
-    ptype: 'creator' | 'podcast_list'
-    episodes: [{url,title,date},...]
-    """
     network_urls: set[str] = set()
+    collected_dom: dict[str, dict] = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headful)
         context = browser.new_context()
         page = context.new_page()
 
-        # 1) Response listener: JSON/XHR válaszokból epizód URL-ek kigyűjtése
         def on_response(resp):
             try:
                 ct = (resp.headers.get("content-type") or "").lower()
                 u = resp.url.lower()
-                if ("application/json" in ct) or u.endswith(".json") or ("xhr" in ct) or ("increment.php" in u):
+                if ("application/json" in ct) or u.endswith(".json") or ("increment.php" in u):
                     txt = resp.text()
-                    network_urls.update(scrape_episode_urls_from_json_text(txt))
+                    network_urls.update(scrape_episode_urls_from_text(txt))
             except Exception:
                 pass
 
@@ -555,44 +660,35 @@ def collect_episodes_hardcore(show_url: str, headful: bool) -> tuple[str, list[d
         page.wait_for_timeout(1200)
         handle_consent(page, timeout_ms=15000)
 
-        # 2) creator skip: ha gyanús creator oldal
+        # Évad: Összes évad
+        select_all_seasons_if_present(page)
+
         if detect_creator_page(page):
             page.close()
             browser.close()
             return "creator", []
 
-        # 3) Tüzetes betöltés: mutass többet + scroll + DOM gyűjtés közben
-        collected_dom: dict[str, dict] = {}
-
-        expected = max(0, estimate_episode_count(page))
+        expected = max(0, estimate_episode_count_by_dates(page))
         stable = 0
         last_total = -1
 
-        for _ in range(220):
+        for i in range(260):
             handle_consent(page, timeout_ms=2000)
+            if i in (5, 25):
+                select_all_seasons_if_present(page)
 
-            # mutass többet többször
-            for __ in range(4):
+            for _ in range(4):
                 if not click_mutass_tobbet(page):
                     break
                 page.wait_for_timeout(700)
 
-            # DOM kártyák
             batch = extract_visible_episode_cards_dom(page)
             for it in batch:
                 u = (it.get("url") or "").strip()
-                if not u:
-                    continue
-                if not u.startswith("http"):
-                    continue
-                # csak atalon.hu internal
-                if urlparse(u).netloc and "atalon.hu" not in urlparse(u).netloc:
-                    continue
-                if "/_next/" in u or "/assets" in u:
+                if not u or "/_next/" in u or "/assets" in u:
                     continue
                 if u not in collected_dom:
                     collected_dom[u] = {
-                        "url": u,
                         "title": (it.get("title") or "").strip() or None,
                         "date": (it.get("date") or "").strip() or None
                     }
@@ -602,7 +698,6 @@ def collect_episodes_hardcore(show_url: str, headful: bool) -> tuple[str, list[d
                     if not collected_dom[u].get("date") and (it.get("date") or "").strip():
                         collected_dom[u]["date"] = (it.get("date") or "").strip()
 
-            # total = DOM + network (de network-et csak URL set-ben tartjuk)
             total = len(collected_dom) + len(network_urls)
             if total == last_total:
                 stable += 1
@@ -610,31 +705,31 @@ def collect_episodes_hardcore(show_url: str, headful: bool) -> tuple[str, list[d
                 stable = 0
                 last_total = total
 
-            # ha elértük a becsült epizód számot, és már stabil, megállhatunk
-            if expected > 0 and total >= expected and stable >= 6:
+            if expected > 0 and total >= expected and stable >= 7:
                 break
 
             moved = scroll_step(page)
             page.wait_for_timeout(650)
 
-            if stable >= 12 and not moved:
+            if stable >= 14 and not moved:
                 break
 
-            # néha frissítsük az expected-et, mert később töltődik be a szöveg is
-            if _ % 20 == 0:
-                expected = max(expected, estimate_episode_count(page))
+            if i % 20 == 0:
+                expected = max(expected, estimate_episode_count_by_dates(page))
 
-        # 4) FAILSAFE PASS 2 (felülről újra, ha gyanúsan kevés)
-        expected_final = max(expected, estimate_episode_count(page))
+        # FAILSAFE PASS 2
+        expected_final = max(expected, estimate_episode_count_by_dates(page))
         total_first = len(collected_dom) + len(network_urls)
 
         if expected_final > 0 and total_first < expected_final:
             scroll_to_top_everywhere(page)
             handle_consent(page, timeout_ms=3000)
+            select_all_seasons_if_present(page)
+
             stable = 0
             last_total = -1
 
-            for _ in range(180):
+            for _ in range(220):
                 for __ in range(4):
                     if not click_mutass_tobbet(page):
                         break
@@ -647,7 +742,6 @@ def collect_episodes_hardcore(show_url: str, headful: bool) -> tuple[str, list[d
                         continue
                     if u not in collected_dom:
                         collected_dom[u] = {
-                            "url": u,
                             "title": (it.get("title") or "").strip() or None,
                             "date": (it.get("date") or "").strip() or None
                         }
@@ -659,33 +753,25 @@ def collect_episodes_hardcore(show_url: str, headful: bool) -> tuple[str, list[d
                     stable = 0
                     last_total = total
 
-                if total >= expected_final and stable >= 6:
+                if total >= expected_final and stable >= 7:
                     break
 
                 moved = scroll_step(page)
                 page.wait_for_timeout(650)
 
-                if stable >= 12 and not moved:
+                if stable >= 14 and not moved:
                     break
-
-        # 5) Merge: DOM + network, majd gap-fill (s01-eXX hiányzókat pótoljuk)
-        merged_urls = set(collected_dom.keys()) | set(network_urls)
-        merged_urls = fill_gaps_episode_urls(merged_urls)
-
-        # meta lista
-        episodes = []
-        for u in sorted(merged_urls):
-            meta = collected_dom.get(u, {"url": u, "title": None, "date": None})
-            episodes.append(meta)
 
         page.close()
         browser.close()
 
-        # ha nincs dátum tömeg és nincs epizód url, akkor creator
-        if len(episodes) == 0:
-            return "creator", []
+    found_urls = set(collected_dom.keys()) | set(network_urls)
+    if not found_urls:
+        return "creator", []
 
-        return "podcast_list", episodes
+    meta_map = {u: {"title": v.get("title"), "date": v.get("date")} for u, v in collected_dom.items()}
+    episodes_ordered = build_predict_list_max_to_zero(found_urls, meta_map)
+    return "podcast_list", episodes_ordered
 
 
 # -------------------- main --------------------
@@ -720,29 +806,42 @@ def main():
             ensure_dir(out_dir_seed)
 
             try:
-                # ha valaki creator oldalt ad meg, ezt most biztosan skippeljük a hardcore collectorral
-                ptype, episodes = collect_episodes_hardcore(seed, headful=args.headful)
-
-                if ptype == "creator":
-                    print("  - PODCASTOK (creator) oldal -> SKIP (nem jelölöm késznek)")
-                    ok_all = False
+                if is_episode_url(seed):
+                    ok = download_episode_requests(
+                        episode_url=seed,
+                        out_dir=out_dir_seed,
+                        session=session,
+                        visited=visited,
+                        source_slug=source_slug,
+                        known_title=None,
+                        known_date=None,
+                        predicted=False
+                    )
+                    ok_all = ok_all and ok
                 else:
-                    print(f"  - Talált epizódok (DOM+Network+GapFill): {len(episodes)}")
-                    if not episodes:
+                    ptype, episodes = collect_episodes_hardcore(seed, headful=args.headful)
+
+                    if ptype == "creator":
+                        print("  - PODCASTOK (creator) oldal -> SKIP (nem jelölöm késznek)")
                         ok_all = False
                     else:
-                        for ep in episodes:
-                            ok = download_episode_requests(
-                                episode_url=ep["url"],
-                                out_dir=out_dir_seed,
-                                session=session,
-                                visited=visited,
-                                source_slug=source_slug,
-                                known_title=ep.get("title"),
-                                known_date=ep.get("date")
-                            )
-                            if not ok:
-                                ok_all = False
+                        print(f"  - Letöltési lista (max->0 predikcióval): {len(episodes)} URL")
+                        if not episodes:
+                            ok_all = False
+                        else:
+                            for ep in episodes:
+                                ok = download_episode_requests(
+                                    episode_url=ep["url"],
+                                    out_dir=out_dir_seed,
+                                    session=session,
+                                    visited=visited,
+                                    source_slug=source_slug,
+                                    known_title=ep.get("title"),
+                                    known_date=ep.get("date"),
+                                    predicted=bool(ep.get("predicted"))
+                                )
+                                if not ok:
+                                    ok_all = False
 
             except Exception as e:
                 print(f"  - Seed hiba: {e}")
