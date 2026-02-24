@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import os
 import re
+import urllib.parse
 from datetime import datetime
 from urllib.parse import urljoin
 
@@ -105,103 +106,128 @@ def main():
 
             for i, ep_url in enumerate(episode_urls):
                 try:
-                    page.goto(ep_url)
-                    page.wait_for_load_state("domcontentloaded")
-                    
-                    # --- JAVÍTVA: Pontos hivatkozás az asztali címre (vagy látható h1-re fallbackként) ---
+                    # --- JAVÍTVA: Biztonságosabb betöltés, felkészülve a külsős letöltő linkekre ---
                     try:
-                        page.wait_for_selector("h1.p-episode__title--desktop, h1:visible", timeout=10000)
+                        page.goto(ep_url, timeout=15000)
+                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception as e:
+                        if ".m4a" in ep_url.lower() or ".mp3" in ep_url.lower() or "anchor.fm" in ep_url:
+                            pass # Ha közvetlen link, a timeout ellenére is megpróbáljuk letölteni
+                        else:
+                            print(f"❌ Oldal betöltési hiba: {ep_url} ({e})")
+                            continue
+
+                    # Várunk a címre VAGY a böngésző beépített audio/video lejátszójára
+                    try:
+                        page.wait_for_selector("h1.p-episode__title--desktop, h1:visible, video, audio", timeout=5000)
                     except PwTimeoutError:
-                        print(f"❌ Nem találom az epizód címét ezen az oldalon: {ep_url}")
-                        continue
+                        pass # Nem dobjuk el azonnal, hátha az URL maga a forrás
                         
                     title_loc = page.locator("h1.p-episode__title--desktop")
                     if title_loc.count() == 0:
                         title_loc = page.locator("h1:visible")
                         
-                    title = title_loc.first.inner_text().strip()
-                    title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:8]
+                    date_str = ""
+                    author = "Ismeretlen_Eloado"
+
+                    # --- JAVÍTVA: Kétféle feldolgozási út (Normál oldal vs. Csupasz lejátszó) ---
+                    if title_loc.count() > 0:
+                        # 1. Normál podcast.hu dizájn
+                        title = title_loc.first.inner_text().strip()
+                        title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:8]
+                        
+                        minutes_locator = page.locator(".p-episode__minutes").first
+                        if minutes_locator.count() > 0:
+                            date_text = minutes_locator.inner_text().strip()
+                            if '|' in date_text:
+                                date_str = date_text.split('|')[0].strip()
+                            else:
+                                date_str = date_text
+                                
+                        if len(date_str) > 20:
+                            date_str = "" 
+
+                        if not date_str:
+                            body_text = page.locator("body").inner_text()
+                            date_match = re.search(r'([A-ZÁÉÍÓÖŐÚÜŰa-záéíóöőúüű]+\s+\d{1,2}\.)\s*\|', body_text)
+                            if date_match:
+                                date_str = date_match.group(1).strip()
+                                
+                        author_locator = page.locator(".p-episode__author").first
+                        if author_locator.count() > 0:
+                            found_author = author_locator.inner_text().strip()
+                            if found_author: 
+                                author = found_author
+                    else:
+                        # 2. Csupasz lejátszó / Külsős link (Nincs h1)
+                        decoded_url = urllib.parse.unquote(ep_url)
+                        title_fallback = decoded_url.split("/")[-1].split("?")[0]
+                        if not title_fallback or len(title_fallback) < 3:
+                            title_fallback = f"Episode_{i}"
+                            
+                        title = "Kulsos_Epizod_" + title_fallback
+                        # Itt az URL-ből generálunk hasht, hogy egyedi legyen
+                        title_hash = hashlib.md5(ep_url.encode('utf-8')).hexdigest()[:8]
+                        date_str = ""
                     
+                    # Hash ellenőrzés (minden útvonalra érvényes)
                     if title_hash in visited:
                         print(f"Már letöltve, ugrás: {title}")
                         continue 
 
-                    # Dátum
-                    date_str = ""
-                    minutes_locator = page.locator(".p-episode__minutes").first
-                    if minutes_locator.count() > 0:
-                        date_text = minutes_locator.inner_text().strip()
-                        if '|' in date_text:
-                            date_str = date_text.split('|')[0].strip()
-                        else:
-                            date_str = date_text
-                            
-                    if len(date_str) > 20:
-                        date_str = "" 
-
-                    if not date_str:
-                        body_text = page.locator("body").inner_text()
-                        date_match = re.search(r'([A-ZÁÉÍÓÖŐÚÜŰa-záéíóöőúüű]+\s+\d{1,2}\.)\s*\|', body_text)
-                        if date_match:
-                            date_str = date_match.group(1).strip()
-                    
+                    # Fájlnév formázása
                     safe_date = ""
                     if date_str:
                         if not re.search(r'\d{4}', date_str):
                             date_str = f"{current_year}. {date_str}"
                         safe_date = sanitize_filename(date_str) + "_"
 
-                    # Előadó (a képed alapján: .p-episode__author)
-                    author = "Ismeretlen_Eloado"
-                    author_locator = page.locator(".p-episode__author").first
-                    if author_locator.count() > 0:
-                        found_author = author_locator.inner_text().strip()
-                        if found_author: 
-                            author = found_author
-                            
                     safe_author = truncate_text(sanitize_filename(author), 50)
                     safe_title = truncate_text(sanitize_filename(title), 100) 
                     
                     print(f"Feldolgozás: {title} | Előadó: {author}")
 
-                    # --- JAVÍTVA: Audio keresés és letöltés, kiterjesztés okos kezelése ---
+                    # --- JAVÍTVA: Audio forrás kinyerése okosabban ---
                     download_success = False
                     try:
-                        # Adunk neki pár másodpercet, hogy a lejátszó megjelenjen a DOM-ban
-                        try:
-                            page.wait_for_selector("audio", state="attached", timeout=5000)
-                        except PwTimeoutError:
-                            pass # Ha nincs, lejjebb úgyis kezeljük a hibát
-                            
+                        audio_src = ""
+                        # Keresés <audio> tagben
                         if page.locator("audio").count() > 0:
-                            audio_locator = page.locator("audio").first
-                            audio_src = audio_locator.get_attribute("src")
+                            audio_src = page.locator("audio").first.get_attribute("src")
+                            if not audio_src and page.locator("audio source").count() > 0:
+                                audio_src = page.locator("audio source").first.get_attribute("src")
+                        
+                        # Keresés <video> tagben (a Chromium gyakran ebbe teszi a nyers audio linkeket!)
+                        if not audio_src and page.locator("video").count() > 0:
+                            audio_src = page.locator("video").first.get_attribute("src")
+                            if not audio_src and page.locator("video source").count() > 0:
+                                audio_src = page.locator("video source").first.get_attribute("src")
+                        
+                        # Ha sehol nincs tag, de az URL eleve média
+                        if not audio_src:
+                            current_url = page.url.lower()
+                            if ".m4a" in current_url or ".mp3" in current_url or "anchor.fm" in current_url:
+                                audio_src = page.url
+                            elif ".m4a" in ep_url.lower() or ".mp3" in ep_url.lower() or "anchor.fm" in ep_url.lower():
+                                audio_src = ep_url
+
+                        if audio_src:
+                            if not audio_src.startswith("http"):
+                                audio_src = urljoin(page.url, audio_src)
                             
-                            if not audio_src:
-                                source_locator = audio_locator.locator("source").first
-                                if source_locator.count() > 0:
-                                    audio_src = source_locator.get_attribute("src")
-
-                            if audio_src:
-                                if not audio_src.startswith("http"):
-                                    audio_src = urljoin(page.url, audio_src)
+                            # Kiterjesztés okos felismerése
+                            ext = ".mp3"
+                            if ".m4a" in audio_src.lower():
+                                ext = ".m4a"
                                 
-                                # Fájl kiterjesztésének kiderítése az URL-ből (.mp3, .m4a, stb.)
-                                ext = ".mp3"
-                                if ".m4a" in audio_src.lower():
-                                    ext = ".m4a"
-                                    
-                                # Fájlnév összerakása a megfelelő kiterjesztéssel
-                                filename = f"{safe_date}{safe_author}_{safe_title}_{title_hash}{ext}"
-                                filepath = os.path.join(args.out, filename)
+                            filename = f"{safe_date}{safe_author}_{safe_title}_{title_hash}{ext}"
+                            filepath = os.path.join(args.out, filename)
 
-                                print(f"Letöltés megkezdése a háttérben ({ext})...")
-                                download_file_with_requests(audio_src, filepath)
-                                download_success = True
-                            else:
-                                print(f"❌ Nem találtam forrás URL-t (src) az audio tagben.")
+                            print(f"Letöltés megkezdése a háttérben ({ext})...")
+                            download_file_with_requests(audio_src, filepath)
+                            download_success = True
                         else:
-                            print(f"❌ Nincs audio lejátszó az oldalon.")
+                            print(f"❌ Nincs felismerhető audio lejátszó vagy link ezen az oldalon.")
 
                     except Exception as e:
                         print(f"❌ Hiba a letöltés során: {e}")

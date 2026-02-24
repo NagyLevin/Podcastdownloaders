@@ -28,9 +28,6 @@ EPISODE_SLUG_RE = re.compile(r"/([a-z0-9-]+-s\d+-e\d+)\b", re.IGNORECASE)
 # 2021. 11. 17.
 HU_DATE_RE = re.compile(r"\b(\d{4})\.\s*(\d{2})\.\s*(\d{2})\.?\b")
 
-# 34:52 vagy 01:04:48
-DUR_RE = re.compile(r"\b(\d{1,2}:\d{2})(:\d{2})?\b")
-
 AUDIO_URL_RE = re.compile(
     r'https://[^\s"<>]*?\.(?:mp3|m4a|wav|aac)[^\s"<>]*',
     re.IGNORECASE
@@ -193,6 +190,10 @@ def build_output_filename(date_norm: str, source_slug: str, episode_slug: str, t
 
 
 def download_audio(session: requests.Session, audio_url: str, out_path: str, referer: str) -> None:
+    """
+    Retry/backoff csak hálózati hibákra és 5xx-re.
+    404 (és általában 4xx, kivéve 429) esetén NINCS retry.
+    """
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         print(f"  - Már létezik, kihagyom: {out_path}")
         return
@@ -200,34 +201,43 @@ def download_audio(session: requests.Session, audio_url: str, out_path: str, ref
     headers = dict(DEFAULT_HEADERS)
     headers["Referer"] = referer
 
-    # gyors connect fail, hosszú read
     timeout = (15, 300)  # (connect, read)
-
     max_tries = 6
     base_sleep = 2.0
 
     last_err = None
+
     for attempt in range(1, max_tries + 1):
         try:
             with session.get(audio_url, stream=True, headers=headers, timeout=timeout) as r:
+                # 404 -> azonnali stop (nincs retry)
+                if r.status_code == 404:
+                    raise HTTPError("404 Client Error: Not Found", response=r)
+
                 r.raise_for_status()
+
                 with open(out_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             f.write(chunk)
             return
-        except (ConnectTimeout, ReadTimeout, ReqConnectionError, HTTPError) as e:
+
+        except HTTPError as e:
             last_err = e
+            code = e.response.status_code if getattr(e, "response", None) is not None else None
 
-            # 4xx (kivéve 429) esetén általában felesleges újrapróbálni
-            if isinstance(e, HTTPError):
-                try:
-                    code = e.response.status_code
-                    if 400 <= code < 500 and code != 429:
-                        raise
-                except Exception:
-                    pass
+            # 404 / 4xx (kivéve 429) -> NINCS retry
+            if code is not None and 400 <= code < 500 and code != 429:
+                raise
 
+            sleep_s = base_sleep * (2 ** (attempt - 1))
+            sleep_s = min(sleep_s, 60.0) + random.uniform(0, 0.8)
+            print(f"  - Letöltési hiba (próba {attempt}/{max_tries}): {e}")
+            print(f"  - Újrapróbálom {sleep_s:.1f} mp múlva...")
+            time.sleep(sleep_s)
+
+        except (ConnectTimeout, ReadTimeout, ReqConnectionError) as e:
+            last_err = e
             sleep_s = base_sleep * (2 ** (attempt - 1))
             sleep_s = min(sleep_s, 60.0) + random.uniform(0, 0.8)
             print(f"  - Letöltési hiba (próba {attempt}/{max_tries}): {e}")
@@ -255,8 +265,8 @@ def download_episode_requests(
     r = session.get(episode_url, headers=DEFAULT_HEADERS, timeout=45)
 
     if r.status_code == 404:
-        visited[episode_url] = {"missing": True, "reason": "404"}
-        print("  - 404 (nincs ilyen) -> jelölöm missing-ként")
+        visited[episode_url] = {"missing": True, "reason": "episode_404"}
+        print("  - 404 (epizód oldal nincs) -> jelölöm missing-ként")
         return True if predicted else False
 
     r.raise_for_status()
@@ -286,9 +296,19 @@ def download_episode_requests(
 
     try:
         download_audio(session, audio_url, out_path, referer=episode_url)
+    except HTTPError as e:
+        code = e.response.status_code if getattr(e, "response", None) is not None else None
+        if code == 404:
+            # mp3 404 -> predikciónál skip, normálnál fail
+            visited[episode_url] = {"missing": True, "reason": "audio_404"}
+            print("  - MP3 404 -> jelölöm missing-ként és skipelem")
+            return True if predicted else False
+
+        print(f"  - Letöltési HTTP hiba: {e}")
+        return False
+
     except Exception as e:
         print(f"  - Letöltési hiba: {e}")
-        # ne dőljön el a seed, csak jelezzük, hogy ez nem sikerült
         return False
 
     visited[episode_url] = {
@@ -347,14 +367,12 @@ def handle_consent(page, timeout_ms: int = 15000) -> bool:
 
 
 def select_all_seasons_if_present(page) -> bool:
-    # van-e egyáltalán "évad" a lapon?
     try:
         if page.locator("text=/évad/i").count() == 0:
             return False
     except Exception:
         return False
 
-    # megnyitó elem: Összes évad / 14. évad / bármi évad
     trigger_selectors = [
         "text=/\\b\\d+\\.\\s*évad\\b/i",
         "text=/Összes\\s+évad/i",
@@ -381,7 +399,6 @@ def select_all_seasons_if_present(page) -> bool:
     except Exception:
         return False
 
-    # katt az "Összes évad" opcióra
     clicked = False
     try:
         opts = page.locator("text=/Összes\\s+évad/i")
@@ -660,7 +677,6 @@ def collect_episodes_hardcore(show_url: str, headful: bool) -> tuple[str, list[d
         page.wait_for_timeout(1200)
         handle_consent(page, timeout_ms=15000)
 
-        # Évad: Összes évad
         select_all_seasons_if_present(page)
 
         if detect_creator_page(page):
@@ -813,8 +829,6 @@ def main():
                         session=session,
                         visited=visited,
                         source_slug=source_slug,
-                        known_title=None,
-                        known_date=None,
                         predicted=False
                     )
                     ok_all = ok_all and ok
