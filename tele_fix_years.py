@@ -324,3 +324,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #python tele_fix_years.py --startpage 1 --endpage 100 --out ./podcasts --startyear 2026 --headless --dry-run

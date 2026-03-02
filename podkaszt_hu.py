@@ -1309,3 +1309,4 @@ def main():
 if __name__ == "__main__":
     main()
     #python podkaszt_hu.py --start-page 1 --end-page 50 --retries 6 --audio-wait 25 --connect-timeout 20 --read-timeout 1200 --download-attempts 8 --backoff 1.3 --g7-delay 1.5 --tilos-delay 1.0 --default-delay 0.4 --out ./podcasts
+    #https://podkaszt.hu/adasok/uj
