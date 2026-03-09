@@ -107,3 +107,300 @@ python3 podkaszt_hu.py --start-page 1 --end-page 5 --headful --slowmo 150
 
 * A `rows=N` a táblázat sorainak száma az oldalon, a `letoltve X/Y` pedig a nem-visited epizódokra számol (ezért eltérhet a `rows` értékétől).
 * Nagy oldalszámoknál előfordulhat, hogy a pagináció UI kattintás nem mindig sikerül; a kód ezért URL-es fallback-ket is próbál.
+
+== podcast_tele.py
+
+A `podcast_tele.py` a https://podcast.hu/ keresőoldalát járja be, epizód-listákat olvas be oldalanként, majd az egyes epizódok részoldaláról letölti az audio-fájlt. A letöltött epizódokról hash alapján vezet nyilvántartást, hogy ne töltsön le ugyanazt többször.
+
+=== Fő funkciók
+
+* Oldalak bejárása:
+** `--startpage` és `--endpage` között lépked a keresési oldalakon (`type=episode`)
+** Minden oldalon felgyűjti a `/podcast/…` típusú epizód linkeket
+
+* Süti banner kezelése:
+** Megpróbálja automatikusan leokézni a „Mindegyik elfogadása” gombot.
+
+* Epizód metaadatok kinyerése:
+** Cím (`h1.p-episode__title--desktop` vagy látható `h1`)
+** Dátum a `.p-episode__minutes` blokkból (vagy fallback regex a teljes oldalszövegből)
+** Előadó (`.p-episode__author`), hiány esetén `Ismeretlen_Eloado`
+
+* Fájlnév és hash:
+** Minden epizódhoz MD5 hash készül a cím alapján (`title_hash`), az első 8 hex karakter kerül a fájlnév végére.
+** A fájlnév formája nagyjából: `YYYY. MM. DD_Előadó_Cím_hash.mp3` (vagy `.m4a`)
+** A cím és előadó max hossza a fájlrendszer-barát nevek érdekében limitált.
+
+* Audio URL felderítése és letöltés:
+** Elsőként az `<audio>` / `<video>` tagek `src` illetve `source` elemét próbálja használni.
+** Ha nincs explicit audio tag, akkor az oldal / URL alapján próbál .mp3 / .m4a / `anchor.fm` linket találni.
+** A tényleges letöltést `requests` végzi, a Playwright cookie-it átemelve, így a védettebb (Megaphone stb.) URL-ek is működnek.
+** Sikertelen feloldás esetén retry mechanizmus (max. 3 próbálkozás epizódonként).
+
+* Nyilvántartás:
+** A sikeresen letöltött epizódok hash-ei a `visited_podcast.txt` fájlban kerülnek mentésre (TAB szeparált: hash + cím).
+** A futás végén kiírja, hány epizódot töltött le összesen az adott futásban.
+
+=== Futtatás
+
+Alap példa:
+
+----
+python3 podcast_tele.py --startpage 1 --endpage 10 --out podcasts
+----
+
+Headless (szerveren futó) mód:
+
+----
+python3 podcast_tele.py --startpage 1 --endpage 50 --out podcasts --headless
+----
+
+=== Paraméterek
+
+* `--startpage`
+** Kezdő oldal sorszáma (default: `1`)
+
+* `--endpage`
+** Utolsó feldolgozandó oldal (default: `100`)
+
+* `--out`
+** Letöltési könyvtár (default: `./podcasts`)
+
+* `--headless`
+** Ha meg van adva, a Playwright böngésző headless módban fut (nincs GUI).
+
+== tele_fix_years.py
+
+A `tele_fix_years.py` NEM tölt le új epizódokat, hanem a már letöltött podcast fájlok fájlnevében javítja / beszúrja az évszámot. Ehhez ugyanúgy bejárja a `podcast.hu` keresőoldalait, a címekből hash-t számol, és a helyi fájlokat ezzel a hash-sel párosítja.
+
+=== Fő funkciók
+
+* Helyi fájlok indexelése:
+** Az `--out` könyvtárban lévő fájlokból `_{8hex}.ext` mintázatú hash-eket keres, és hash → fájllista mapet épít.
+
+* Oldalak bejárása:
+** `--startpage`–`--endpage` között bejárja a `podcast.hu` keresési oldalakat (akárcsak a letöltő script).
+** Minden epizódnál kiszámolja a title-hash-t, és megnézi, van-e hozzá lokális fájl.
+
+* Év meghatározása:
+** A `.p-episode__minutes` szövegéből dátumot keres, majd abból a hónapot.
+** Hónapváltás figyelése (jan → dec): ha az aktuális hónap 12, az előző 1, akkor az évszámot csökkenti (visszafelé haladásnál).
+** Az aktuális „logikai” év a `--startyear` értékből indul.
+
+* Fájlnév átnevezése:
+** Ha a fájlnév elején VAN év (YYYY…), akkor azt cseréli az új évre.
+** Ha NINCS, akkor beszúrja az évszámot a fájlnév elejére a `--year-sep` szeparátorral (pl. `"2026. "`).
+** Ütközés esetén sorszámozott `__renamedN` név jön létre.
+
+* Statikus futás (dry-run):
+** `--dry-run` esetén csak kiírja, hogy mit nevezne át, de ténylegesen nem módosít fájlokat.
+
+=== Futtatás
+
+Dry-run példa:
+
+----
+python tele_fix_years.py --startpage 1 --endpage 100 --out ./podcasts --startyear 2026 --headless --dry-run
+----
+
+Valódi átnevezés:
+
+----
+python tele_fix_years.py --startpage 1 --endpage 100 --out ./podcasts --startyear 2026 --headless
+----
+
+=== Paraméterek
+
+* `--startpage`, `--endpage`
+** Bejárandó oldaltartomány a `podcast.hu` keresőben.
+
+* `--out`
+** Az a könyvtár, ahol a már letöltött fájlok találhatók (default: `./podcasts`).
+
+* `--headless`
+** Headless Playwright futás (default: False).
+
+* `--startyear`
+** Az év, ahonnan a logikai visszaszámlálás indul (default: aktuális év).
+
+* `--dry-run`
+** Csak szimulálja az átnevezést, fájlt nem piszkál.
+
+* `--year-sep`
+** Az év utáni szeparátor a fájlnév elején (pl. `". "` vagy `"._"`).
+
+== atalon_podcast_links.py
+
+Az `atalon_podcast_links.py` Playwright-tal bejárja az `https://atalon.hu/podcastok` oldalt, görget és „Mutass többet” típusú gombokat próbál kattintani, miközben gyűjti a releváns podcast linkeket. A kimenet egy egyszerű szövegfájl, amely később bemenetként használható a letöltő szkriptekhez.
+
+=== Fő funkciók
+
+* Linkgyűjtés:
+** Az összes `<a href="…">` linket kigyűjti, majd normalizálja (relatív → abszolút, query/fragment eltávolítás).
+** Kizárja a menü/jogi/kategória URL-eket (`/impresszum`, `/adatkezelesi-nyilatkozat` stb.).
+
+* Szűrés mód szerint:
+** `MODE = "all"` – minden releváns podcast URL benne marad.
+** `MODE = "shows"` – csak „műsor” oldalakat tart meg.
+** `MODE = "episodes"` – csak epizód (slug végén 6 karakteres ID) URL-eket tart meg.
+
+* Scroll + „Load more” kezelése:
+** Max. `MAX_SCROLLS` iterációig görget, és ha `NO_NEW_LIMIT` kör óta nem nő a talált linkek száma, megáll.
+** Ha talál „Tovább / Load more / Mutass többet” gombot, megpróbálja időnként megnyomni.
+
+* Kimenet:
+** Az összegyűjtött URL-eket az `OUTFILE` (pl. `atalon_podcast_links.txt`) fájlba írja, soronként egy linket.
+
+=== Futtatás
+
+Az alap script közvetlen futtatható (paraméter nélkül), az `OUTFILE` és `MODE` konstansok a fájl elején szerkeszthetők.
+
+== atalon_downloader.py
+
+Az `atalon_downloader.py` az Atalon-os podcastok letöltésére szolgál. Bemenetként egy szövegfájlt vár, amely soronként egy URL-t tartalmaz (`#`-el kezdődő sorok kihagyva). Ezek lehetnek komplett műsor-oldalak vagy egyedi epizód URL-ek. A script világosan szétválasztja a „seed” (kiinduló) oldalak kezelését, a Playwright-alapú epizódlista-gyűjtést és a tényleges letöltést (`requests`-szel, retries-szel).
+
+=== Főbb részek
+
+* Bemenet és visited kezelés:
+** `--input`: TXT fájl, soronként 1 URL, `#`-el kommentelhető sorokkal.
+** `--visited`: JSON fájl, amelybe az összes már letöltött (vagy hiányzónak jelölt) epizód URL metaadata kerül.
+** Ha egy seed (egész sor) sikeresen lefut, a script `# ` jellel megjelöli a sort az input fájlban.
+
+* Epizódlista építés Playwright-tal:
+** `collect_episodes_hardcore()` megpróbálja a műsor-oldalakon belül az összes epizód URL-jét kinyerni.
+** A DOM-ból és a hálózati JSON válaszokból (increment.php, `__NEXT_DATA__` stb.) is gyűjt URL-eket.
+** Ha felismeri, hogy „creator” (csak „PODCASTOK” gyűjtőoldal), nem tekinti késznek a seed-et.
+
+* Predikció epizód slugokból:
+** Az `sXX-eYY` mintázat alapján (szezon/epizód) visszafelé „felrajzolja” az epizódlistát max `MAX_PREDICT_EP`-ig.
+** Jelzi, hogy mely epizódok „predicted” (`predicted=True`), ezeknél 404 / no-audio esetén megengedőbb.
+
+* Letöltés:
+** Minden epizódot `download_episode_requests()` kezel, amely:
+*** kinyeri az audio URL-t a `__NEXT_DATA__` scriptből vagy a HTML-ből,
+*** eldönti a kiterjesztést (.mp3 / .m4a / .wav / .aac),
+*** fájlnevet generál: `YYYY-MM-DD__forras__epizodslug__cim.ext` formában,
+*** több-lépcsős retry/backoff-ot használ hálózati és 5xx hibákra,
+*** 404-re nem próbál újra (kivéve speciális eseteket).
+** A letöltött fájlokról metaadat-objektum kerül a `visited.json`-ba.
+
+* Kimeneti struktúra:
+** `--out` könyvtár alatt minden seed-hez külön alkönyvtár kerül, a seed URL slug-jának megfelelő névvel.
+
+=== Futtatás
+
+Példa, ahol az `atalon_podcast_links.txt` a bemenet:
+
+----
+python atalon_downloader.py --input atalon_podcast_links.txt --out atalon --visited visited.json --headful
+----
+
+Headless mód:
+
+----
+python atalon_downloader.py --input atalon_podcast_links.txt --out atalon --visited visited.json
+----
+
+=== Paraméterek
+
+* `--input`
+** Bemeneti TXT (seed linkek), kötelező.
+
+* `--out`
+** Gyökér kimeneti mappa. Seed-enként alkönyvtár készül (default: `atalon`).
+
+* `--visited`
+** JSON fájl a már feldolgozott epizódokról (default: `visited.json`).
+
+* `--headful`
+** Ha megadod, a Playwright böngésző látható (debug), különben headless.
+
+== soundcloud.py
+
+A `soundcloud.py` SoundCloud „search/sets” (playlists) oldalakról gyűjti ki a playlist/sets linkeket, majd szöveg- és JSON-fájlba menti őket. Működik tisztán HTTP-s HTML-parse módban, illetve Playwright-alapú, görgetős módban is.
+
+=== Fő funkciók
+
+* HTML-alapú gyűjtés (`static` mód):
+** A megadott URL-t `requests`-szel letölti, a HTML-ből BeautifulSoup-pal keresi ki azokat az `<a>` linkeket, amelyek `/…/sets/…` mintára illeszkednek.
+
+* Böngészős gyűjtés (`browser` mód):
+** Playwright-tal betölti a keresőoldalt, kezelni próbálja a cookie bannert.
+** Többször végiggörgeti az oldalt, minden körben gyűjti a `/sets/` linkeket, amíg `max_scrolls` vagy „nem nő az elemszám” limitet el nem éri.
+
+* Duplikáció kezelés:
+** A playlist URL-ekből normalizált (query/fragment nélküli) URL-t készít, és egy `seen_playlists.json` fájlban tárolja.
+** Minden futáskor külön megmondja, hány új URL jelent meg az előző futáshoz képest.
+
+* Kimenetek:
+** `playlists.txt` – egyszerű lista (soronként egy URL).
+** `playlists.json` – JSON lista.
+** `seen_playlists.json` – az összes eddig valaha látott playlist.
+
+=== Futtatás
+
+Playwright módban (ajánlott hosszabb listákhoz):
+
+----
+python soundcloud.py --url "https://soundcloud.com/search/sets?q=magyar%20podcast" --out sc_playlists --mode browser
+----
+
+Statikus HTML-parszoló módban:
+
+----
+python soundcloud.py --url "https://soundcloud.com/search/sets?q=magyar%20podcast" --out sc_playlists --mode static
+----
+
+=== Paraméterek
+
+* `--url`
+** A SoundCloud search/sets URL, kötelező.
+
+* `--out`
+** Kimeneti mappa (itt jönnek létre a `playlists*.{txt,json}` fájlok).
+
+* `--mode`
+** `static` vagy `browser` (default: `browser`).
+
+* `--max-scrolls`, `--settle-rounds`
+** Böngészős módban a görgetés/„stabilitás” beállításai.
+
+* `--headful`
+** Ha megadod, mutatja a böngészőt (debug).
+
+== soundcloudurl.py
+
+A `soundcloudurl.py` (a fájl elején kommentben `soundcloud_playlists_scrape.py` néven hivatkozva) egy egyszerűbb, Playwright-alapú scraper. Fix keresőkifejezést (`QUERY = "magyar podcast"`) használ, átvált a SoundCloud „Playlists / sets” fülére, és addig görget, amíg új playlist URL-eket talál.
+
+* A talált `/sets/` URL-eket normalizálja, majd a `soundcloud_playlists_{QUERY}.txt` fájlba menti.
+* Beégetett konstansok vezérlik a görgetés mennyiségét (`MAX_SCROLLS`, `NO_NEW_LIMIT`).
+* Elsősorban gyors, ad-hoc playlist link gyűjtéshez használható.
+
+== soundcloud_downloader.py
+
+A `soundcloud_downloader.py` egy általános letöltő yt-dlp fölött, amely egy txt-ből olvasott linklistát dolgoz fel. Minden sikeres letöltés után automatikusan „kipipálja” a sort (a linket `# link` formára alakítja az input fájlban).
+
+=== Fő funkciók
+
+* Bemenet:
+** `--input`: olyan szövegfájl, amely soronként egy URL-t tartalmaz. A `#`-el kezdődő vagy üres sorokat kihagyja.
+
+* Letöltés yt-dlp-vel:
+** `bestaudio/best` formátumot választ.
+** A kimeneti sablon: `%(title)s.%(ext)s` az `--output` mappában, fájlrendszer-barát fájlnevekkel (`restrictfilenames`, `windowsfilenames`).
+
+* Átnevezés dátum prefixszel:
+** A letöltés végén a progress hook a metaadatokból (upload_date, release_date, timestamp) `YYYY-MM-DD` prefixet generál.
+** A tényleges fájlnév így `YYYY-MM-DD - EredetiCím.ext` lesz, ütközés esetén számozással.
+
+* „Kipipálás” az input fájlban:
+** Ha egy link sikeresen lefut, ugyanabban a fájlban a sort `# link` formára alakítja.
+
+=== Futtatás
+
+Alap példa:
+
+----
+python3 soundcloud_downloader.py --input inputok.txt --output soundcloud_letoltesek
+----
+
